@@ -54,6 +54,9 @@ func buildHTTPRequest(ctx context.Context, req *Request, preset *fingerprint.Pre
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Normalize request (Content-Length: 0 for empty POST/PUT/PATCH, Content-Type detection, etc.)
+	normalizeRequestWithBody(httpReq, req.Body)
+
 	// Set preset headers first
 	for key, value := range preset.Headers {
 		httpReq.Header.Set(key, value)
@@ -130,5 +133,138 @@ func Decompress(data []byte, encoding string) ([]byte, error) {
 	default:
 		// Unknown encoding, return as-is
 		return data, nil
+	}
+}
+
+// normalizeRequest applies standard HTTP behaviors to a request
+// This ensures the request conforms to HTTP standards that browsers follow
+func normalizeRequest(req *http.Request, bodyLen int) {
+	method := strings.ToUpper(req.Method)
+
+	// Set Content-Length: 0 for methods that typically have a body but body is empty
+	// This is standard behavior for POST, PUT, PATCH with no body
+	if (method == "POST" || method == "PUT" || method == "PATCH") && bodyLen == 0 {
+		req.ContentLength = 0
+		req.Header.Set("Content-Length", "0")
+	}
+
+	// Ensure Host header is set (Go usually handles this, but be explicit)
+	if req.Host == "" && req.URL != nil {
+		req.Host = req.URL.Host
+	}
+
+	// For methods that shouldn't have a body, ensure we don't send Content-Length
+	// GET, HEAD, DELETE, OPTIONS, TRACE typically don't have bodies
+	// (though HTTP/1.1 allows it, browsers don't send Content-Length for these)
+	if method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "TRACE" {
+		if bodyLen == 0 {
+			req.Header.Del("Content-Length")
+		}
+	}
+}
+
+// normalizeRequestWithBody applies standard HTTP behaviors including Content-Type detection
+// This should be called when we have access to the actual body bytes
+func normalizeRequestWithBody(req *http.Request, body []byte) {
+	normalizeRequest(req, len(body))
+
+	// Auto-detect Content-Type if not set and body is present
+	if len(body) > 0 && req.Header.Get("Content-Type") == "" {
+		contentType := detectContentType(body)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+	}
+}
+
+// detectContentType attempts to detect the content type from the body
+// Returns empty string if unable to detect
+func detectContentType(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+
+	// Check for JSON (starts with { or [)
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 {
+		first := trimmed[0]
+		if first == '{' || first == '[' {
+			// Validate it looks like JSON
+			if isLikelyJSON(trimmed) {
+				return "application/json"
+			}
+		}
+	}
+
+	// Check for XML (starts with < and contains ?>)
+	if len(trimmed) > 0 && trimmed[0] == '<' {
+		if bytes.HasPrefix(trimmed, []byte("<?xml")) ||
+			bytes.HasPrefix(trimmed, []byte("<soap")) ||
+			bytes.HasPrefix(trimmed, []byte("<SOAP")) {
+			return "application/xml"
+		}
+		// Could be HTML or other XML
+		if bytes.Contains(trimmed[:min(100, len(trimmed))], []byte("html")) {
+			return "text/html"
+		}
+	}
+
+	// Check for form data (key=value&key2=value2)
+	if isFormEncoded(trimmed) {
+		return "application/x-www-form-urlencoded"
+	}
+
+	// Default: don't set, let the user specify
+	return ""
+}
+
+// isLikelyJSON checks if the body looks like valid JSON structure
+func isLikelyJSON(body []byte) bool {
+	if len(body) < 2 {
+		return false
+	}
+	first := body[0]
+	last := body[len(body)-1]
+
+	// Check for matching brackets
+	if first == '{' && last == '}' {
+		return true
+	}
+	if first == '[' && last == ']' {
+		return true
+	}
+	return false
+}
+
+// isFormEncoded checks if body looks like URL-encoded form data
+func isFormEncoded(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	// Form data typically has key=value pairs with & separators
+	// and doesn't contain newlines or special characters outside of encoding
+	hasEquals := bytes.Contains(body, []byte("="))
+	hasNewline := bytes.Contains(body, []byte("\n"))
+	hasSpace := bytes.Contains(body, []byte(" "))
+
+	// Simple heuristic: has = sign, no raw newlines or spaces
+	return hasEquals && !hasNewline && !hasSpace
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// hasBody returns true if the HTTP method typically has a request body
+func hasBody(method string) bool {
+	switch strings.ToUpper(method) {
+	case "POST", "PUT", "PATCH":
+		return true
+	default:
+		return false
 	}
 }

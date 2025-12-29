@@ -72,6 +72,9 @@ func (c *Client) Prepare(ctx context.Context, req *Request) (*PreparedRequest, e
 		return nil, err
 	}
 
+	// Normalize request (Content-Length: 0 for empty POST/PUT/PATCH, Content-Type detection, etc.)
+	normalizeRequestWithBody(httpReq, req.Body)
+
 	// Apply preset headers
 	for key, value := range c.preset.Headers {
 		httpReq.Header.Set(key, value)
