@@ -135,6 +135,9 @@ func (c *HTTP3Client) Do(ctx context.Context, req *Request) (*Response, error) {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Normalize request (Content-Length: 0 for empty POST/PUT/PATCH, Content-Type detection, etc.)
+	normalizeRequestWithBody(httpReq, req.Body)
+
 	// Set preset headers first
 	for key, value := range c.preset.Headers {
 		httpReq.Header.Set(key, value)

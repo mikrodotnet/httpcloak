@@ -139,6 +139,9 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// Normalize request (Content-Length: 0 for empty POST/PUT/PATCH, Content-Type detection, etc.)
+	normalizeRequestWithBody(httpReq, req.Body)
+
 	// Apply headers based on FetchMode
 	applyModeHeaders(httpReq, c.preset, req, parsedURL)
 
