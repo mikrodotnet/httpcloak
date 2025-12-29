@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -168,6 +169,7 @@ func (p *PreparedRequest) SetBody(body []byte) *PreparedRequest {
 	p.Body = body
 	p.HTTPRequest.Body = io.NopCloser(bytes.NewReader(body))
 	p.HTTPRequest.ContentLength = int64(len(body))
+	p.HTTPRequest.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	return p
 }
 

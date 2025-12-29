@@ -568,19 +568,15 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 				// HTTP/3 failed, mark it and fall back to HTTP/2
 				c.markH3Failed(hostKey)
 
-				// Recreate request body if needed
-				if len(req.Body) > 0 {
-					httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
-				}
+				// Reset request body for retry
+				resetRequestBody(httpReq, req.Body)
 
 				resp, usedProtocol, err = c.doHTTP2(ctx, host, port, httpReq, timing, startTime)
 				if err != nil {
 					// HTTP/2 also failed, try HTTP/1.1
 					c.markH2Failed(hostKey)
 
-					if len(req.Body) > 0 {
-						httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
-					}
+					resetRequestBody(httpReq, req.Body)
 
 					resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
 					if err != nil {
@@ -595,9 +591,7 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 				// HTTP/2 failed, try HTTP/1.1
 				c.markH2Failed(hostKey)
 
-				if len(req.Body) > 0 {
-					httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
-				}
+				resetRequestBody(httpReq, req.Body)
 
 				resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
 				if err != nil {
@@ -711,10 +705,8 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 			return nil, fmt.Errorf("failed to handle auth challenge: %w", err)
 		}
 		if shouldRetry {
-			// Recreate request body
-			if len(req.Body) > 0 {
-				httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
-			}
+			// Reset request body for retry
+			resetRequestBody(httpReq, req.Body)
 			// Apply auth again with challenge info
 			if err := auth.Apply(httpReq); err != nil {
 				return nil, fmt.Errorf("failed to apply authentication after challenge: %w", err)

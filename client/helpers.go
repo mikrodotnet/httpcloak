@@ -144,9 +144,14 @@ func Decompress(data []byte, encoding string) ([]byte, error) {
 func normalizeRequest(req *http.Request, bodyLen int) {
 	method := strings.ToUpper(req.Method)
 
-	// Set Content-Length: 0 for methods that typically have a body but body is empty
-	// This is standard behavior for POST, PUT, PATCH with no body
-	if (method == "POST" || method == "PUT" || method == "PATCH") && bodyLen == 0 {
+	// If there's a body, always set Content-Length explicitly
+	// Some servers require this header to be present
+	if bodyLen > 0 {
+		req.ContentLength = int64(bodyLen)
+		req.Header.Set("Content-Length", fmt.Sprintf("%d", bodyLen))
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		// POST/PUT/PATCH with empty body must send Content-Length: 0
+		// This is standard HTTP behavior
 		req.ContentLength = 0
 		req.Header.Set("Content-Length", "0")
 	}
@@ -156,9 +161,8 @@ func normalizeRequest(req *http.Request, bodyLen int) {
 		req.Host = req.URL.Host
 	}
 
-	// For methods that shouldn't have a body, ensure we don't send Content-Length
-	// GET, HEAD, DELETE, OPTIONS, TRACE typically don't have bodies
-	// (though HTTP/1.1 allows it, browsers don't send Content-Length for these)
+	// For methods that typically don't have a body AND body is empty,
+	// don't send Content-Length (matches browser behavior)
 	if method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "TRACE" {
 		if bodyLen == 0 {
 			req.Header.Del("Content-Length")
@@ -269,5 +273,16 @@ func hasBody(method string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// resetRequestBody resets the request body for retry attempts
+// This handles both non-empty bodies and empty POST/PUT/PATCH bodies
+func resetRequestBody(httpReq *http.Request, body []byte) {
+	if len(body) > 0 {
+		httpReq.Body = io.NopCloser(bytes.NewReader(body))
+	} else if hasBody(httpReq.Method) {
+		// POST/PUT/PATCH with empty body - still need a valid (empty) reader
+		httpReq.Body = io.NopCloser(bytes.NewReader([]byte{}))
 	}
 }

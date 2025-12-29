@@ -193,9 +193,8 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 			resp, usedProtocol, err = c.doHTTP3(ctx, host, port, httpReq, timing, startTime)
 			if err != nil {
 				c.markH3Failed(hostKey)
-				if len(req.Body) > 0 {
-					httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
-				}
+				resetRequestBody(httpReq, req.Body)
+				
 				resp, usedProtocol, err = c.doHTTP2(ctx, host, port, httpReq, timing, startTime)
 			}
 		} else {
@@ -205,9 +204,8 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 		// If H2 failed and we should try H1, attempt fallback
 		if err != nil && c.shouldUseH1(hostKey) {
 			c.markH2Failed(hostKey)
-			if len(req.Body) > 0 {
-				httpReq.Body = io.NopCloser(bytes.NewReader(req.Body))
-			}
+			resetRequestBody(httpReq, req.Body)
+			
 			resp, usedProtocol, err = c.doHTTP1(ctx, host, port, httpReq, timing, startTime)
 		}
 
