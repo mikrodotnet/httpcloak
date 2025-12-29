@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -16,10 +14,9 @@ import (
 	"github.com/sardanioss/httpcloak/fingerprint"
 )
 
-func init() {
-	// Suppress quic-go's buffer size warning (informational, doesn't affect functionality)
-	log.SetOutput(io.Discard)
-}
+// Note: quic-go may print buffer size warnings to stderr. These are informational
+// and don't affect functionality. We don't suppress them globally as that would
+// break logging for the entire application.
 
 // QUICConn represents a persistent QUIC connection
 type QUICConn struct {

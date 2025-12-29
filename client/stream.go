@@ -170,6 +170,15 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 	// Determine protocol based on ForceProtocol option
 	switch req.ForceProtocol {
 	case ProtocolHTTP3:
+		// Force HTTP/3 only - but not possible with proxy
+		if c.config.Proxy != "" {
+			cancel()
+			return nil, fmt.Errorf("HTTP/3 cannot be used with proxy: QUIC uses UDP which cannot tunnel through HTTP proxies")
+		}
+		if c.quicManager == nil {
+			cancel()
+			return nil, fmt.Errorf("HTTP/3 is disabled (no QUIC manager available)")
+		}
 		resp, usedProtocol, err = c.doHTTP3(ctx, host, port, httpReq, timing, startTime)
 		if err != nil {
 			cancel()

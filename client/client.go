@@ -63,12 +63,8 @@ import (
 	"github.com/sardanioss/httpcloak/transport"
 )
 
-func init() {
-	// Seed random for organic jitter - real browsers have slight variations
-	// in header values (e.g., Accept-Language quality). Perfect consistency
-	// is itself a fingerprint that indicates automation.
-	rand.Seed(time.Now().UnixNano())
-}
+// Note: As of Go 1.20, the global random generator is automatically seeded.
+// No manual seeding needed for organic jitter in header values.
 
 // Client is an HTTP client with connection pooling and fingerprint spoofing
 // By default, it tries HTTP/3 first, then HTTP/2, then HTTP/1.1 as fallback
@@ -118,8 +114,10 @@ func NewClient(presetName string, opts ...Option) *Client {
 		h2Manager = pool.NewManagerWithTLSConfig(preset, config.InsecureSkipVerify)
 	}
 
+	// Only create QUIC manager if H3 is not disabled AND no proxy is configured
+	// QUIC uses UDP and cannot be tunneled through HTTP proxies
 	var quicManager *pool.QUICManager
-	if !config.DisableH3 {
+	if !config.DisableH3 && config.Proxy == "" {
 		quicManager = pool.NewQUICManager(preset, h2Manager.GetDNSCache())
 	}
 
@@ -540,7 +538,13 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 			return nil, err
 		}
 	case ProtocolHTTP3:
-		// Force HTTP/3 only
+		// Force HTTP/3 only - but not possible with proxy
+		if c.config.Proxy != "" {
+			return nil, fmt.Errorf("HTTP/3 cannot be used with proxy: QUIC uses UDP which cannot tunnel through HTTP proxies")
+		}
+		if c.quicManager == nil {
+			return nil, fmt.Errorf("HTTP/3 is disabled (no QUIC manager available)")
+		}
 		resp, usedProtocol, err = c.doHTTP3(ctx, host, port, httpReq, timing, startTime)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP/3 failed: %w", err)

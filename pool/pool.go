@@ -288,12 +288,14 @@ func (p *HostPool) dialHappyEyeballs(ctx context.Context, ips []net.IP) (net.Con
 		return nil, fmt.Errorf("no IP addresses available")
 	}
 
-	// Get IPv6 and IPv4 addresses separately
-	ipv6, ipv4, err := p.dnsCache.ResolveIPv6First(ctx, p.host)
-	if err != nil {
-		// Fallback to the provided IPs
-		ipv6 = nil
-		ipv4 = ips
+	// Separate IPv6 and IPv4 from the provided IPs (already resolved, no second lookup)
+	var ipv6, ipv4 []net.IP
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			ipv4 = append(ipv4, ip)
+		} else {
+			ipv6 = append(ipv6, ip)
+		}
 	}
 
 	dialer := &net.Dialer{Timeout: p.connectTimeout}

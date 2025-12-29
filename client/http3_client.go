@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -253,6 +254,10 @@ func decompressHTTP3(data []byte, encoding string) ([]byte, error) {
 
 // decompressGzip decompresses gzip data
 func decompressGzip(data []byte) ([]byte, error) {
-	// Import gzip in the main client file
-	return data, nil // Placeholder - actual implementation in client.go
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
 }
