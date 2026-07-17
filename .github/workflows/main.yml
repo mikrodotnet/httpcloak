@@ -1,0 +1,82 @@
+name: Sync Upstream
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream
+        run: git remote add upstream https://github.com/sardanioss/httpcloak.git
+
+      - name: Fetch upstream (branches + tags)
+        run: git fetch upstream --tags
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          git checkout main
+          if git merge-base --is-ancestor upstream/main main; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream into main
+        if: steps.check.outputs.has_changes == 'true'
+        id: merge
+        run: git merge upstream/main --no-edit
+
+      - name: Push changes
+        if: steps.check.outputs.has_changes == 'true' && steps.merge.outcome == 'success'
+        run: git push origin main
+
+      - name: Determine upstream version tag
+        if: steps.check.outputs.has_changes == 'true' && steps.merge.outcome == 'success'
+        id: version
+        run: |
+          TAG=$(git tag --merged upstream/main --sort=-creatordate | head -n1)
+          if [ -z "$TAG" ]; then
+            echo "No tags found on upstream; skipping tag creation."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create matching tag on fork
+        if: steps.check.outputs.has_changes == 'true' && steps.merge.outcome == 'success' && steps.version.outputs.tag != ''
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally, skipping."
+          else
+            git tag -a "$TAG" -m "Synced with upstream $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Abort and report on conflict
+        if: steps.check.outputs.has_changes == 'true' && steps.merge.outcome == 'failure'
+        run: |
+          git merge --abort
+          gh issue create \
+            --title "Upstream sync failed: merge conflict" \
+            --body "Automatic merge of upstream/main into main failed due to a conflict. Manual resolution required — pull upstream and merge locally, then push."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
