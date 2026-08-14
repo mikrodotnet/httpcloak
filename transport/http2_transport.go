@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	http "github.com/sardanioss/http"
@@ -37,6 +38,14 @@ type HTTP2Transport struct {
 	conns   map[string]*persistentConn
 	connsMu sync.RWMutex
 
+	// retired holds connections evicted from conns while a response body was
+	// still streaming on them. Their close is deferred until the body finishes,
+	// and without this list nothing would ever revisit them: cleanup() only
+	// walks conns, so an evicted connection whose body is never closed would
+	// keep its socket for the process lifetime and Close() could not reclaim it.
+	retired   []*persistentConn
+	retiredMu sync.Mutex
+
 	// dialGroup collapses concurrent dials for the same pool key into a single
 	// connection attempt, so a burst of requests to one host (especially behind
 	// a proxy) opens one connection instead of a storm of N.
@@ -55,11 +64,13 @@ type HTTP2Transport struct {
 	hasPSKSpec bool
 
 	// Configuration
-	maxIdleTime        time.Duration
-	maxConnAge         time.Duration
-	connectTimeout     time.Duration
-	insecureSkipVerify bool
-	localAddr          string // Local IP to bind outgoing connections
+	maxIdleTime          time.Duration
+	maxConnAge           time.Duration
+	abandonedBodyTimeout time.Duration
+	connectTimeout       time.Duration
+	insecureSkipVerify   bool
+	tlsVerify            *TLSVerify
+	localAddr            string // Local IP to bind outgoing connections
 
 	// Cleanup
 	stopCleanup chan struct{}
@@ -71,14 +82,139 @@ type persistentConn struct {
 	host            string
 	tlsConn         *utls.UConn
 	h2Conn          *http2.ClientConn
-	createdAt       time.Time
-	lastUsedAt      time.Time
-	useCount        int64
-	inFlight        int32 // number of active RoundTrip calls — prevents cleanup during long requests
-	sessionResumed  bool  // True if TLS session was resumed (faster handshake)
-	tlsVersion      uint16
-	cipherSuite     uint16
-	mu              sync.Mutex
+	createdAt      time.Time
+	lastUsedAt     time.Time
+	useCount       int64
+	inFlight       int32 // requests still using this conn, including their response bodies
+	closeRequested bool  // close as soon as the last in-flight request finishes
+	closed         bool  // close() has already run
+	sessionResumed bool  // True if TLS session was resumed (faster handshake)
+	tlsVersion     uint16
+	cipherSuite    uint16
+	mu             sync.Mutex
+
+	// lastProgress is the unix-nano timestamp of the most recent body read.
+	// Kept outside the mutex because it is touched on every Read. Only
+	// meaningful while inFlight > 0, where it distinguishes a slow-but-live
+	// download from a body the caller abandoned without closing.
+	lastProgress atomic.Int64
+}
+
+// release marks one request as finished with the connection. If a close was
+// deferred because requests were still streaming, it happens here.
+func (c *persistentConn) release() {
+	c.mu.Lock()
+	c.inFlight--
+	c.lastUsedAt = time.Now()
+	shouldClose := c.closeRequested && c.inFlight <= 0
+	c.mu.Unlock()
+
+	if shouldClose {
+		c.close()
+	}
+}
+
+// requestClose closes the connection now if nothing is using it, otherwise
+// defers the close until the last in-flight response body is done. Evicting a
+// connection from the pool must never yank the socket out from under a
+// response that is still streaming (issue #83).
+func (c *persistentConn) requestClose() {
+	c.mu.Lock()
+	if c.inFlight > 0 {
+		c.closeRequested = true
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+	c.close()
+}
+
+// retire evicts a connection that is no longer wanted in the pool.
+//
+// If nothing is using it the socket closes immediately. If a response body is
+// still streaming, the close is deferred until that body finishes AND the
+// connection is tracked in t.retired, so cleanup() can still apply the
+// abandoned-body bound to it and Close() can still reclaim it. Dropping an
+// evicted-but-draining connection on the floor - which is what a bare
+// requestClose() at an eviction site does - leaks the socket, its h2 ClientConn
+// and that connection's reader goroutine for the process lifetime whenever the
+// caller never closes the body.
+func (t *HTTP2Transport) retire(conn *persistentConn) {
+	conn.mu.Lock()
+	deferred := conn.inFlight > 0 && !conn.closed
+	if deferred {
+		conn.closeRequested = true
+	}
+	conn.mu.Unlock()
+
+	if !deferred {
+		conn.close()
+		return
+	}
+
+	t.retiredMu.Lock()
+	t.retired = append(t.retired, conn)
+	t.retiredMu.Unlock()
+}
+
+// sweepRetired closes evicted connections whose bodies have finished, and
+// applies the abandoned-body bound to those whose caller walked away.
+func (t *HTTP2Transport) sweepRetired() {
+	t.retiredMu.Lock()
+	defer t.retiredMu.Unlock()
+
+	kept := t.retired[:0]
+	for _, conn := range t.retired {
+		conn.mu.Lock()
+		done := conn.closed
+		conn.mu.Unlock()
+		if done {
+			continue // release() already fired the deferred close
+		}
+		if t.isConnDestroyable(conn) {
+			go conn.close()
+			continue
+		}
+		kept = append(kept, conn)
+	}
+	t.retired = kept
+}
+
+// connBodyGuard keeps a pooled connection marked in-use for as long as the
+// caller is reading the response body.
+//
+// HTTP/2 RoundTrip returns as soon as the response *headers* arrive, so without
+// this the connection looked idle the moment a download started. A transfer
+// lasting longer than maxIdleTime was then closed underneath the reader by the
+// pool cleanup, which is what issue #83 reported at roughly 120s (90s idle plus
+// the 30s cleanup tick).
+type connBodyGuard struct {
+	io.ReadCloser
+	conn *persistentConn
+	once sync.Once
+}
+
+func (g *connBodyGuard) Read(p []byte) (int, error) {
+	n, err := g.ReadCloser.Read(p)
+	if n > 0 {
+		g.conn.lastProgress.Store(time.Now().UnixNano())
+	}
+	if err != nil {
+		// io.EOF included: the transfer is over, stop holding the connection
+		// even if the caller forgets to Close.
+		g.release()
+	}
+	return n, err
+}
+
+func (g *connBodyGuard) Close() error {
+	err := g.ReadCloser.Close()
+	g.release()
+	return err
+}
+
+func (g *connBodyGuard) release() {
+	g.once.Do(g.conn.release)
 }
 
 // NewHTTP2Transport creates a new HTTP/2 transport with uTLS
@@ -131,10 +267,15 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		sessionCache:   sessionCache,
 		shuffleSeed:    shuffleSeed,
 		hasPSKSpec:     hasPSKSpec,
-		maxIdleTime:    90 * time.Second,
-		maxConnAge:     5 * time.Minute,
-		connectTimeout: 30 * time.Second,
-		stopCleanup:    make(chan struct{}),
+		maxIdleTime: 90 * time.Second,
+		maxConnAge:  5 * time.Minute,
+		// A response body that has not produced a single byte for this long is
+		// treated as abandoned by its caller, so the connection can be
+		// reclaimed. Without a bound here, a caller that never closes a body
+		// would pin the socket forever.
+		abandonedBodyTimeout: 10 * time.Minute,
+		connectTimeout:       30 * time.Second,
+		stopCleanup:          make(chan struct{}),
 	}
 
 	// Apply localAddr from config
@@ -181,9 +322,10 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Make request
 	resp, err := conn.h2Conn.RoundTrip(req)
 	if err != nil {
-		conn.mu.Lock()
-		conn.inFlight--
-		conn.mu.Unlock()
+		// release(), not a bare decrement: if this conn was evicted while the
+		// request was in flight its close was deferred, and only release()
+		// fires it once the count reaches zero.
+		conn.release()
 
 		// Connection might be dead, remove it and retry once
 		t.removeConn(key)
@@ -204,20 +346,26 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err = conn.h2Conn.RoundTrip(req)
 		if err != nil {
-			conn.mu.Lock()
-			conn.inFlight--
-			conn.mu.Unlock()
+			conn.release()
 			t.removeConn(key)
 			return nil, err
 		}
 	}
 
-	// Update last used time
+	// Keep the connection marked in-use until the caller finishes with the body.
+	// RoundTrip returning only means the headers arrived; the body may stream for
+	// minutes, and releasing here made the pool think the connection was idle.
 	conn.mu.Lock()
 	conn.lastUsedAt = time.Now()
-	conn.inFlight--
 	conn.useCount++
 	conn.mu.Unlock()
+	conn.lastProgress.Store(time.Now().UnixNano())
+
+	if resp.Body == nil {
+		conn.release()
+	} else {
+		resp.Body = &connBodyGuard{ReadCloser: resp.Body, conn: conn}
+	}
 
 	return resp, nil
 }
@@ -254,7 +402,7 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 
 	// Close old unusable connection and remove from map
 	if exists {
-		go conn.close()
+		go t.retire(conn)
 		delete(t.conns, key)
 	}
 	t.connsMu.Unlock()
@@ -341,12 +489,23 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 	return v.(*persistentConn), nil
 }
 
-// isConnUsable checks if a connection is still usable
+// isConnUsable reports whether a connection may be handed out for a NEW request.
+//
+// This is deliberately separate from isConnDestroyable: "too old to start
+// another request on" and "safe to close" are different questions, and
+// conflating them is what let cleanup close connections that were still
+// streaming a response (issue #83).
+//
 // Note: We don't check CanTakeNewRequest() here because it can return false
 // even when the connection is fine. We'll handle errors during actual use.
 func (t *HTTP2Transport) isConnUsable(conn *persistentConn) bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
+
+	// Already evicted and waiting for its last body to finish.
+	if conn.closeRequested {
+		return false
+	}
 
 	// Check age
 	if time.Since(conn.createdAt) > t.maxConnAge {
@@ -365,6 +524,38 @@ func (t *HTTP2Transport) isConnUsable(conn *persistentConn) bool {
 	}
 
 	return true
+}
+
+// isConnDestroyable reports whether a connection can be closed right now.
+//
+// A connection with requests still on it is never destroyable, however old or
+// idle-looking it is, with one exception: if its response body has made no
+// progress for abandonedBodyTimeout the caller has clearly walked away without
+// closing it, and holding the socket forever would be a leak.
+func (t *HTTP2Transport) isConnDestroyable(conn *persistentConn) bool {
+	conn.mu.Lock()
+	inFlight := conn.inFlight
+	lastUsedAt := conn.lastUsedAt
+	h2Conn := conn.h2Conn
+	conn.mu.Unlock()
+
+	if inFlight > 0 {
+		last := lastUsedAt
+		if p := conn.lastProgress.Load(); p > 0 {
+			if progressed := time.Unix(0, p); progressed.After(last) {
+				last = progressed
+			}
+		}
+		return time.Since(last) > t.abandonedBodyTimeout
+	}
+
+	if h2Conn == nil {
+		return true
+	}
+	if time.Since(conn.createdAt) > t.maxConnAge {
+		return true
+	}
+	return time.Since(lastUsedAt) > t.maxIdleTime
 }
 
 // createConn creates a new persistent H2 connection, degrading gracefully when
@@ -578,6 +769,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 		EncryptedClientHelloConfigList:     echConfigList, // ECH configuration (if available)
 		KeyLogWriter:                       keyLogWriter,
 	}
+	t.tlsVerify.Apply(tlsConfig)
 
 	// Only enable session cache if we have PSK spec - prevents panic when session
 	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
@@ -1083,7 +1275,9 @@ func (t *HTTP2Transport) removeConn(key string) {
 	t.connsMu.Unlock()
 
 	if exists && conn != nil {
-		go conn.close()
+		// Deferred: another request may still be streaming on this connection
+		// even though the caller that triggered the removal hit an error.
+		go t.retire(conn)
 	}
 }
 
@@ -1093,6 +1287,7 @@ func (c *persistentConn) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.closed = true
 	if c.h2Conn != nil {
 		c.h2Conn.Close()
 	}
@@ -1122,11 +1317,17 @@ func (t *HTTP2Transport) cleanup() {
 	defer t.connsMu.Unlock()
 
 	for key, conn := range t.conns {
-		if !t.isConnUsable(conn) {
+		// Note: destroyable, not "not usable". A connection that is merely too
+		// old to take new requests may still be streaming a response body.
+		if t.isConnDestroyable(conn) {
 			delete(t.conns, key)
 			go conn.close()
 		}
 	}
+
+	// Evicted-but-draining connections live outside t.conns; they need the same
+	// bound applied or they would never be revisited.
+	t.sweepRetired()
 }
 
 // Close shuts down the transport
@@ -1145,6 +1346,16 @@ func (t *HTTP2Transport) Close() {
 		go conn.close()
 	}
 	t.conns = nil
+
+	// Connections evicted while still streaming are not in t.conns. Shutdown is
+	// unconditional, so close them here too rather than leaving their sockets
+	// behind after the transport is gone.
+	t.retiredMu.Lock()
+	for _, conn := range t.retired {
+		go conn.close()
+	}
+	t.retired = nil
+	t.retiredMu.Unlock()
 }
 
 // Refresh closes all connections but keeps the TLS session cache intact.
@@ -1176,6 +1387,12 @@ func (t *HTTP2Transport) SetSessionCache(cache utls.ClientSessionCache) {
 }
 
 // SetInsecureSkipVerify sets whether to skip TLS certificate verification
+// SetTLSVerify installs caller-supplied certificate verification hooks.
+// Only verification is configurable; nothing here affects the ClientHello.
+func (t *HTTP2Transport) SetTLSVerify(v *TLSVerify) {
+	t.tlsVerify = v
+}
+
 func (t *HTTP2Transport) SetInsecureSkipVerify(skip bool) {
 	t.insecureSkipVerify = skip
 }
@@ -1342,9 +1559,10 @@ func (t *HTTP2Transport) Connect(ctx context.Context, host, port string) error {
 	}
 	// Check again in case another goroutine created one
 	if oldConn, exists := t.conns[key]; exists {
-		// Close the old one if not usable
+		// Close the old one if not usable. Deferred, because "not usable for a
+		// new request" does not mean nothing is streaming on it.
 		if !t.isConnUsable(oldConn) {
-			go oldConn.close()
+			go t.retire(oldConn)
 		} else {
 			// Old one is still good, close the new one we just created
 			go conn.close()

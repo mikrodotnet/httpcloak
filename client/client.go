@@ -44,13 +44,18 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	http "github.com/sardanioss/http"
 	"io"
 	"math"
 	"math/rand"
 	"net"
-	http "github.com/sardanioss/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -70,13 +75,13 @@ import (
 // Client is an HTTP client with connection pooling and fingerprint spoofing
 // By default, it tries HTTP/3 first, then HTTP/2, then HTTP/1.1 as fallback
 type Client struct {
-	poolManager      *pool.Manager
-	quicManager      *pool.QUICManager
-	masqueTransport  *transport.HTTP3Transport // MASQUE proxy transport (if using MASQUE)
+	poolManager       *pool.Manager
+	quicManager       *pool.QUICManager
+	masqueTransport   *transport.HTTP3Transport // MASQUE proxy transport (if using MASQUE)
 	socks5H3Transport *transport.HTTP3Transport // SOCKS5 UDP relay transport for HTTP/3
-	h1Transport      *transport.HTTP1Transport
-	preset           *fingerprint.Preset
-	config           *ClientConfig
+	h1Transport       *transport.HTTP1Transport
+	preset            *fingerprint.Preset
+	config            *ClientConfig
 
 	// Authentication
 	auth Auth
@@ -201,6 +206,28 @@ func NewClient(presetName string, opts ...Option) *Client {
 	}
 	if socks5H3Transport != nil {
 		socks5H3Transport.SetInsecureSkipVerify(config.InsecureSkipVerify)
+	}
+
+	// Install caller-supplied TLS verification hooks (issue #85). Previously
+	// WithTLSConfig stored the config and nothing ever read it, so the callbacks
+	// silently never fired.
+	if config.VerifyPeerCertificate != nil || config.VerifyConnection != nil || config.RootCAs != nil {
+		tlsVerify := &transport.TLSVerify{
+			VerifyPeerCertificate: config.VerifyPeerCertificate,
+			VerifyConnection:      config.VerifyConnection,
+			RootCAs:               config.RootCAs,
+		}
+		h2Manager.SetTLSVerify(tlsVerify)
+		h1Transport.SetTLSVerify(tlsVerify)
+		if quicManager != nil {
+			quicManager.SetTLSVerify(tlsVerify)
+		}
+		if masqueTransport != nil {
+			masqueTransport.SetTLSVerify(tlsVerify)
+		}
+		if socks5H3Transport != nil {
+			socks5H3Transport.SetTLSVerify(tlsVerify)
+		}
 	}
 
 	// Propagate ConnectTo mappings (domain fronting)
@@ -429,6 +456,26 @@ type Request struct {
 
 	// Per-request retry override (nil = use client config)
 	DisableRetry bool
+
+	// IncludeTLSInfo populates Response.TLS with the leaf certificate's
+	// details. Off by default: parsing cert fields on every request isn't
+	// free, so opt in per-request rather than paying for it unconditionally.
+	IncludeTLSInfo bool
+
+	// HeaderOrder, when non-empty, sets the header order for this single request
+	// and overrides whatever SetHeaderOrder installed on the client. Nothing is
+	// stored on the client and no lock is taken, so concurrent requests can each
+	// carry a different order.
+	//
+	// The list is a prefix, not a whole-request replacement: headers you name are
+	// emitted first, in this order, and everything you leave out keeps the
+	// preset's own position (then a stable alphabetical tail). Name every header
+	// you send and you get exactly that wire order. Names are case-insensitive.
+	// Empty or nil means the client-wide order applies.
+	//
+	// The order carries across followed redirects, alongside the headers it
+	// orders and the other per-request options the redirect path already carries.
+	HeaderOrder []string
 }
 
 // SetHeader sets a header value, replacing any existing values.
@@ -490,9 +537,56 @@ type Response struct {
 	// Redirect history
 	RedirectHistory []*RedirectInfo
 
+	// TLS is the negotiated TLS connection's leaf-certificate info. Only
+	// populated when Request.IncludeTLSInfo is true.
+	TLS *TLSInfo
+
 	// bodyBytes caches the body after reading
 	bodyBytes []byte
 	bodyRead  bool
+}
+
+// TLSInfo describes the leaf certificate and negotiated parameters of a
+// response's TLS connection.
+type TLSInfo struct {
+	Version            string
+	CipherSuite        string
+	NegotiatedProtocol string
+	SubjectCN          string
+	Issuer             string
+	DNSNames           []string
+	NotBefore          time.Time
+	NotAfter           time.Time
+	SelfSigned         bool
+	SHA256Fingerprint  string
+}
+
+// buildTLSInfo extracts TLSInfo from the leaf certificate of a connection.
+// Takes primitives rather than a *tls.ConnectionState because the forked
+// http package's Response.TLS is actually *utls.ConnectionState (the
+// forked http aliases "tls" to github.com/sardanioss/utls) -- matching
+// certpin.go's own approach of never depending on that concrete type,
+// only on the standard x509 certificates it carries.
+// Returns nil if there are no peer certificates.
+func buildTLSInfo(version, cipherSuite uint16, negotiatedProtocol string, peerCertificates []*x509.Certificate) *TLSInfo {
+	if len(peerCertificates) == 0 {
+		return nil
+	}
+	leaf := peerCertificates[0]
+	fingerprint := sha256.Sum256(leaf.Raw)
+
+	return &TLSInfo{
+		Version:            tls.VersionName(version),
+		CipherSuite:        tls.CipherSuiteName(cipherSuite),
+		NegotiatedProtocol: negotiatedProtocol,
+		SubjectCN:          leaf.Subject.CommonName,
+		Issuer:             leaf.Issuer.CommonName,
+		DNSNames:           leaf.DNSNames,
+		NotBefore:          leaf.NotBefore,
+		NotAfter:           leaf.NotAfter,
+		SelfSigned:         bytes.Equal(leaf.RawIssuer, leaf.RawSubject),
+		SHA256Fingerprint:  hex.EncodeToString(fingerprint[:]),
+	}
 }
 
 // Close closes the response body.
@@ -559,6 +653,32 @@ func (r *Response) GetHeader(key string) string {
 // GetHeaders returns all values for the given header key (case-insensitive).
 func (r *Response) GetHeaders(key string) []string {
 	return r.Headers[strings.ToLower(key)]
+}
+
+// ErrNoLocation is returned by Response.Location when the response has no
+// Location header.
+//
+// Deliberately the same error value as transport.ErrNoLocation rather than a
+// separate sentinel with the same text: a caller doing
+// errors.Is(err, ErrNoLocation) must match regardless of which layer produced
+// the response.
+var ErrNoLocation = transport.ErrNoLocation
+
+// Location returns the URL of the response's "Location" header, if present.
+// A relative Location is resolved against the URL of the request that produced
+// the response (FinalURL), mirroring net/http's Response.Location.
+// ErrNoLocation is returned when no Location header is present.
+func (r *Response) Location() (*url.URL, error) {
+	lv := r.GetHeader("Location")
+	if lv == "" {
+		return nil, ErrNoLocation
+	}
+	if r.FinalURL != "" {
+		if base, err := url.Parse(r.FinalURL); err == nil {
+			return base.Parse(lv)
+		}
+	}
+	return url.Parse(lv)
 }
 
 // IsSuccess returns true if the status code is 2xx
@@ -767,11 +887,11 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 	if c.config.TLSOnly {
 		// TLSOnly mode: skip preset headers, only set required Host header
 		// User has full control over HTTP headers
-		applyTLSOnlyHeaders(httpReq, c.preset, req, parsedURL, c.getHeaderOrder())
+		applyTLSOnlyHeaders(httpReq, c.preset, req, parsedURL, c.effectiveHeaderOrder(req))
 	} else {
 		// Normal mode: apply preset headers based on FetchMode
 		// The library is smart: pick a mode, get coherent headers automatically
-		applyModeHeaders(httpReq, c.preset, req, parsedURL, c.getHeaderOrder())
+		applyModeHeaders(httpReq, c.preset, req, parsedURL, c.effectiveHeaderOrder(req))
 	}
 
 	// Apply authentication
@@ -1036,6 +1156,10 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 				FollowRedirects: req.FollowRedirects,
 				MaxRedirects:    req.MaxRedirects,
 				DisableRetry:    true, // Don't retry redirects
+				// Follows carriedHeaders above: a header the caller slotted
+				// explicitly would otherwise be re-placed by the preset table on
+				// the next hop, so the ordering rides along with the headers.
+				HeaderOrder: req.HeaderOrder,
 			}
 
 			// 307/308 preserve body (use cached bytes since original reader was consumed)
@@ -1086,6 +1210,11 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
+	var tlsInfo *TLSInfo
+	if req.IncludeTLSInfo && resp.TLS != nil {
+		tlsInfo = buildTLSInfo(resp.TLS.Version, resp.TLS.CipherSuite, resp.TLS.NegotiatedProtocol, resp.TLS.PeerCertificates)
+	}
+
 	response := &Response{
 		StatusCode:      resp.StatusCode,
 		Headers:         headers,
@@ -1095,6 +1224,7 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 		Protocol:        usedProtocol,
 		Request:         req,
 		RedirectHistory: redirectHistory,
+		TLS:             tlsInfo,
 		bodyBytes:       respBody,
 		bodyRead:        true,
 	}
@@ -1182,7 +1312,16 @@ func (c *Client) doHTTP3(ctx context.Context, host, port string, httpReq *http.R
 	}
 
 	firstByteTime := time.Now()
-	resp, err := conn.HTTP3RT.RoundTrip(httpReq)
+	// See doHTTP2: conn.RoundTrip keeps the connection busy for the body's life.
+	resp, err := conn.RoundTrip(httpReq)
+	if errors.Is(err, pool.ErrConnRetired) {
+		// Pre-send rejection only, so retrying once is method-safe.
+		conn, err = c.quicManager.GetConn(ctx, host, port)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to get QUIC connection: %w", err)
+		}
+		resp, err = conn.RoundTrip(httpReq)
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -1209,7 +1348,22 @@ func (c *Client) doHTTP2(ctx context.Context, host, port string, httpReq *http.R
 	}
 
 	firstByteTime := time.Now()
-	resp, err := conn.HTTP2Conn.RoundTrip(httpReq)
+	// conn.RoundTrip (not conn.HTTP2Conn.RoundTrip) holds the pooled connection
+	// busy for the whole life of the response body, so the pool reaper cannot
+	// close the socket underneath a download (issue #83).
+	resp, err := conn.RoundTrip(httpReq)
+	if errors.Is(err, pool.ErrConnRetired) {
+		// The connection was retired between GetConn and RoundTrip. That
+		// sentinel is returned strictly BEFORE anything is written, so httpReq's
+		// body is untouched and one retry on a fresh connection is method-safe.
+		// A second retirement falls through to the generic error path; this
+		// never loops. (Retry borrowed from PR #84.)
+		conn, err = c.poolManager.GetConn(ctx, host, port)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to get connection: %w", err)
+		}
+		resp, err = conn.RoundTrip(httpReq)
+	}
 	if err != nil {
 		return nil, "", fmt.Errorf("request failed: %w", err)
 	}
@@ -1416,6 +1570,10 @@ func (c *Client) GetUDPProxy() string {
 // SetHeaderOrder sets a custom header order for all requests.
 // Pass nil or empty slice to reset to preset's default order.
 // Order should contain lowercase header names.
+//
+// This is client-wide state. To vary the order per request without serializing
+// concurrent callers on it, set Request.HeaderOrder instead; a request that
+// carries one ignores whatever is installed here.
 func (c *Client) SetHeaderOrder(order []string) {
 	c.customHeaderOrderMu.Lock()
 	defer c.customHeaderOrderMu.Unlock()
@@ -1463,6 +1621,18 @@ func (c *Client) getHeaderOrder() []string {
 	return c.customHeaderOrder
 }
 
+// effectiveHeaderOrder returns the header order for a single request: the
+// request's own HeaderOrder when it sets one, otherwise the client-wide order
+// from SetHeaderOrder. The per-request list wins outright — merging two prefixes
+// would let one silently reorder the other. Lowercasing is left to
+// transport.CompleteHeaderOrder, which normalizes every name it places.
+func (c *Client) effectiveHeaderOrder(req *Request) []string {
+	if req != nil && len(req.HeaderOrder) > 0 {
+		return req.HeaderOrder
+	}
+	return c.getHeaderOrder()
+}
+
 // Stats returns connection pool statistics
 func (c *Client) Stats() map[string]struct {
 	Total    int
@@ -1499,11 +1669,10 @@ func applyTLSOnlyHeaders(httpReq *http.Request, preset *fingerprint.Preset, req 
 	// Use H2HeaderOrder (full HPACK position table) so user-supplied headers
 	// outside the default emit set (cache-control, content-type, cookie, …)
 	// land in their real-Chrome position instead of being appended at the end.
-	if len(customHeaderOrder) > 0 {
-		httpReq.Header[http.HeaderOrderKey] = customHeaderOrder
-	} else {
-		httpReq.Header[http.HeaderOrderKey] = preset.H2HeaderOrder()
-	}
+	// CompleteHeaderOrder names whatever is still left over so it can't fall
+	// through to the encoders' randomised map iteration. User headers are
+	// already merged into httpReq.Header above, hence the nil.
+	httpReq.Header[http.HeaderOrderKey] = transport.CompleteHeaderOrder(customHeaderOrder, preset.H2HeaderOrder(), httpReq.Header, nil)
 
 	// Set pseudo-header order from preset H2Config (explicit > heuristic > Chrome default)
 	if order := preset.H2PseudoHeaderOrder(); order != nil {
@@ -1577,12 +1746,9 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 	// Set header order for HTTP/2 and HTTP/3 fingerprinting
 	// Use H2HeaderOrder (full HPACK position table) — see the matching
 	// comment in transport.applyPresetHeaders for the rationale. Caller
-	// override still wins.
-	if len(customHeaderOrder) > 0 {
-		httpReq.Header[http.HeaderOrderKey] = customHeaderOrder
-	} else {
-		httpReq.Header[http.HeaderOrderKey] = preset.H2HeaderOrder()
-	}
+	// override still wins, completed with the preset table and then whatever
+	// is left, so nothing reaches the encoders' randomised map iteration.
+	httpReq.Header[http.HeaderOrderKey] = transport.CompleteHeaderOrder(customHeaderOrder, preset.H2HeaderOrder(), httpReq.Header, nil)
 
 	// Set pseudo-header order from preset H2Config (explicit > heuristic > Chrome default)
 	if order := preset.H2PseudoHeaderOrder(); order != nil {
@@ -1688,7 +1854,6 @@ func sniffXHRMode(req *Request) bool {
 	// submissions always carry one of the form Content-Types above.
 	return true
 }
-
 
 // applyNavigationModeHeaders sets headers for page navigation (human clicked link)
 // Uses preset's values for Accept/Accept-Encoding/Accept-Language when available,

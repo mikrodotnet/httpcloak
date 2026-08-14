@@ -75,6 +75,9 @@ Pin or disable specific HTTP versions.
 | Signature | Default | What it does |
 |---|---|---|
 | `WithInsecureSkipVerify() SessionOption` | verify enabled | Skips TLS certificate verification. Test-only, never ship this enabled. |
+| `WithVerifyPeerCertificate(fn func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error) SessionOption` | none | Mirrors `crypto/tls.Config.VerifyPeerCertificate`. Runs after the normal certificate checks with the raw certificates and any chains that were built; returning an error aborts the handshake. This is the hook for certificate pinning. Pair with `WithInsecureSkipVerify()` to replace the default verification rather than add to it. |
+| `WithVerifyConnection(fn func(cs tls.ConnectionState) error) SessionOption` | none | Mirrors `crypto/tls.Config.VerifyConnection`. Runs after `WithVerifyPeerCertificate`, on every handshake including resumptions. The state is the standard library type. |
+| `WithTLSConfig(cfg *tls.Config) SessionOption` | none | Convenience wrapper that reads the verification settings from a standard `*tls.Config`. Honoured: `VerifyPeerCertificate`, `VerifyConnection`, `RootCAs`, `InsecureSkipVerify`. **Ignored:** everything that shapes the ClientHello, including `CipherSuites`, `MinVersion`, `MaxVersion`, `CurvePreferences`, `NextProtos` and `ServerName`. Those come from the profile, and honouring them would silently change how the client looks on the wire. Prefer the two options above, which make the supported surface obvious. |
 | `WithDisableECH() SessionOption` | ECH attempted when DNS has it | Skips the ECH (Encrypted Client Hello) HTTPS RR lookup. Saves ~15-20ms on first connect at the cost of the privacy bump ECH gives you. |
 | `WithECHFrom(domain string) SessionOption` | target domain | Pulls ECH config from a different domain's DNS than the request target. Common pattern for Cloudflare: `WithECHFrom("cloudflare-ech.com")` works for any CF-fronted host. |
 | `WithSessionCache(backend, errCb) SessionOption` | in-memory | Plugs a distributed TLS session cache (e.g. Redis). `backend` implements `transport.SessionCacheBackend`; `errCb` is called when the backend fails. Lets multiple processes share TLS resumption tickets. |
@@ -147,7 +150,7 @@ Methods on `*Session` itself, called after `NewSession` returns. These aren't `S
 | `GetProxy() string` | Current unified or TCP proxy URL. |
 | `GetTCPProxy() string` | Current TCP proxy URL. |
 | `GetUDPProxy() string` | Current UDP proxy URL. |
-| `SetHeaderOrder(order []string)` | Override the preset's header order. Lowercase names. `nil` resets to preset default. |
+| `SetHeaderOrder(order []string)` | Override the preset's header order. Lowercase names. Treated as a prefix: named headers lead, the preset's table covers the rest, anything left over is sorted. `nil` resets to preset default. |
 | `GetHeaderOrder() []string` | Current header order, or preset default if no override. |
 | `SetSessionIdentifier(id string)` | TLS-cache key namespace. Used when a session is registered with `LocalProxy` so distributed caches isolate per-session tickets. |
 | `Warmup(ctx, url) error` | Simulates a real browser page load: fetches HTML + CSS/JS/image subresources with realistic headers, priorities, and timing. Warms TLS, cookies, ticket cache. |
