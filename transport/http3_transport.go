@@ -99,8 +99,13 @@ func MeasureInitialRTT(_ context.Context, _ string, _ int) map[uint64][]byte {
 //
 // Deprecated: pass params via quic.Config.AdditionalTransportParameters
 // instead. No RTT is measured; see MeasureInitialRTT.
-func MeasureAndSetInitialRTT(ctx context.Context, host string, port int) {
-	quic.SetAdditionalTransportParameters(MeasureInitialRTT(ctx, host, port))
+func MeasureAndSetInitialRTT(_ context.Context, _ string, _ int) {
+	// Deliberately does nothing. It used to publish Chrome's transport
+	// parameters into a PROCESS-GLOBAL set, which every connection in the
+	// process then inherited regardless of which browser it was impersonating.
+	// One call was enough to put Google-specific parameters on every Firefox and
+	// Safari connection for the life of the process. Per-connection parameters
+	// are selected from the preset now; see AdditionalTransportParamsForPreset.
 }
 
 // ResetInitialRTT is a no-op.
@@ -121,10 +126,40 @@ func AdditionalTransportParamsForPreset(preset *fingerprint.Preset, _ context.Co
 	if preset == nil {
 		return nil
 	}
-	if preset.H3QUICTransportParamOrder() != "chrome" {
-		return nil
+	if !presetIsChromeQUIC(preset) {
+		// Empty, NOT nil. quic-go treats a nil additional-parameter map as "fall
+		// back to the process-global set", and MeasureAndSetInitialRTT writes
+		// Chrome's parameters into exactly that global. Returning nil here would
+		// therefore let one call to a deprecated helper put Chrome's
+		// browser-specific parameters back on every non-Chrome profile, for the
+		// life of the process, silently undoing this gate.
+		return map[uint64][]byte{}
 	}
 	return BuildChromeTransportParams()
+}
+
+// presetIsChromeQUIC reports whether a preset impersonates a Chromium-based
+// client on QUIC, and so should carry Chrome's browser-specific transport
+// parameters (version_information and google_connection_options).
+//
+// This deliberately does NOT key off H3QUICTransportParamOrder(). That field
+// selects how the parameters are ORDERED and defaults to "chrome" for any
+// preset that does not set it, so using it as an identity test made every
+// non-Chrome preset advertise Google-only parameters: a Firefox-shaped
+// ClientHello carrying google_connection_options is a flat contradiction to
+// anyone reading the handshake, which is precisely the tell this library exists
+// to avoid.
+//
+// The QUIC ClientHello identity is the honest signal. It is "Chrome" for the
+// desktop and Android Chrome presets, and something else (or empty) for
+// Firefox, Safari and the WebKit-based iOS Chrome presets, which really do not
+// send these.
+func presetIsChromeQUIC(preset *fingerprint.Preset) bool {
+	if preset.QUICClientHelloID.Client != "" {
+		return preset.QUICClientHelloID.Client == "Chrome"
+	}
+	// No QUIC-specific identity: fall back to the TCP one rather than assuming.
+	return preset.ClientHelloID.Client == "Chrome"
 }
 
 // generateGREASEVersion generates a GREASE version of form 0x?a?a?a?a
@@ -246,6 +281,31 @@ func (t *HTTP3Transport) SetTLSVerify(v *TLSVerify) {
 	if t.tlsConfig != nil {
 		v.Apply(t.tlsConfig)
 	}
+}
+
+// Preset returns the profile new connections are built from.
+func (t *HTTP3Transport) Preset() *fingerprint.Preset { return t.preset }
+
+// SetPreset swaps the browser profile used for subsequent connections.
+//
+// The cached TLS config and ClientHello spec were both derived from the old
+// profile, so they are rebuilt; otherwise a profile switch would keep dialling
+// with the previous browser's ClientHello.
+func (t *HTTP3Transport) SetPreset(preset *fingerprint.Preset) {
+	if preset == nil {
+		return
+	}
+	t.preset = preset
+	if id := preset.QUICClientHelloID; id.Client != "" {
+		t.clientHelloID = &id
+	}
+	t.cachedClientHelloSpec = t.getSpecForHost("")
+	t.Refresh()
+}
+
+// TLSVerify returns the installed verification hooks, or nil.
+func (t *HTTP3Transport) TLSVerify() *TLSVerify {
+	return t.tlsVerify
 }
 
 func (t *HTTP3Transport) SetInsecureSkipVerify(skip bool) {
@@ -1012,8 +1072,11 @@ func (t *HTTP3Transport) raceQUICDialWithECH(ctx context.Context, host string, i
 		return nil, fmt.Errorf("no addresses to dial")
 	}
 
-	// Capture PSK spec for 0-RTT before racing (was set in dialQUICWithDNS)
-	pskSpec := cfg.CachedClientHelloSpec
+	// NOTE: deliberately no captured spec here. utls mutates a ClientHelloSpec in
+	// place during ApplyPreset, so handing the same *ClientHelloSpec to several
+	// staggered dials lets two in-flight handshakes corrupt each other's
+	// ClientHello. getSpecForHost regenerates one per call, which is what the
+	// per-attempt closure below uses.
 
 	// Helper to create config with a given ECH config for each dial attempt.
 	// Parameterised by ech so the same racer can be retried WITHOUT ECH (ech=nil)
@@ -1022,8 +1085,9 @@ func (t *HTTP3Transport) raceQUICDialWithECH(ctx context.Context, host string, i
 	makeConfigWith := func(ech []byte) func() *quic.Config {
 		return func() *quic.Config {
 			cfgCopy := cfg.Clone()
-			// Keep PSK spec for 0-RTT (includes early_data extension)
-			cfgCopy.CachedClientHelloSpec = pskSpec
+			// Fresh spec per attempt, not a shared pointer. Still the PSK
+			// variant for 0-RTT when a session exists: getSpecForHost picks it.
+			cfgCopy.CachedClientHelloSpec = t.getSpecForHost(host)
 			// Enable ECH for all connections (fresh and resumed)
 			// PSK info is now properly copied to inner ClientHello
 			if ech != nil {
@@ -1101,8 +1165,10 @@ func (t *HTTP3Transport) happyEyeballsDialQUIC(ctx context.Context, addrs []*net
 	const attemptDelay = 250 * time.Millisecond
 	return staggeredRace(ctx, len(addrs), attemptDelay,
 		func(rctx context.Context, idx int) (*quic.Conn, error) {
-			// Each attempt gets its own config clone (fresh ECH/PSK spec), so
-			// concurrent dials never share/mutate one config.
+			// Each attempt gets its own config clone AND its own regenerated
+			// ClientHello spec, so concurrent dials never mutate shared state.
+			// The spec matters most: utls rewrites it in place during
+			// ApplyPreset, so a shared one is corrupted by the racing dial.
 			return t.quicTransport.DialEarly(rctx, addrs[idx], tlsCfg, makeConfig())
 		},
 		func(c *quic.Conn) { c.CloseWithError(0, "lost happy-eyeballs race") },
