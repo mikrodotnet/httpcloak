@@ -62,7 +62,7 @@ The full set of fields a single preset can declare. Each section corresponds to 
 ```json
 {
   "name":     "my-chrome",          // required, unique
-  "based_on": "chrome-148-windows", // optional, parent preset name
+  "based_on": "chrome-152-windows", // optional, parent preset name
   "tls":      { ... },              // TLS fingerprint
   "http2":    { ... },              // HTTP/2 fingerprint
   "http3":    { ... },              // HTTP/3 + QUIC fingerprint
@@ -93,8 +93,8 @@ The TLS layer. Two configuration modes that don't mix: a named uTLS ClientHello 
 
 ```json
 "tls": {
-  "client_hello":      "chrome-148-windows",       // mutually exclusive with ja3
-  "psk_client_hello":  "chrome-148-windows-psk",
+  "client_hello":      "chrome-152-windows",       // mutually exclusive with ja3
+  "psk_client_hello":  "chrome-152-windows-psk",
   "quic_client_hello": "chrome-148-quic",
   "quic_psk_client_hello": "chrome-148-quic-psk",
 
@@ -113,7 +113,7 @@ The TLS layer. Two configuration modes that don't mix: a named uTLS ClientHello 
 
 | Field | Type | Notes |
 |---|---|---|
-| `client_hello` | string | uTLS ClientHello ID name (e.g. `"chrome-146-windows"`). Mutually exclusive with `ja3`. |
+| `client_hello` | string | uTLS ClientHello ID name (e.g. `"chrome-152-windows"`). Mutually exclusive with `ja3`. |
 | `psk_client_hello` | string | PSK variant for TLS session resumption. Requires `client_hello` (directly or via `based_on`). |
 | `quic_client_hello` | string | QUIC-specific ClientHello. Cannot be used with `ja3`. |
 | `quic_psk_client_hello` | string | QUIC PSK variant. |
@@ -127,6 +127,60 @@ The TLS layer. Two configuration modes that don't mix: a named uTLS ClientHello 
 | `permute_extensions` | bool | When true, extension order shuffles per handshake (Chrome 110+ behaviour). |
 | `record_size_limit` | uint16 | TLS extension 28 value. |
 | `key_share_curves` | int | Number of curves to advertise key shares for. `1` for Chrome (X25519MLKEM768 only), `3` for Firefox. |
+
+### Captured ClientHello mode
+
+A third way to describe the handshake, alongside `client_hello` and `ja3`: hand
+over the bytes of a real one.
+
+```json
+"tls": {
+  "raw_client_hello":     "FgMBAgA...",
+  "raw_psk_client_hello": "FgMBAiA...",
+  "allow_blunt_mimicry":  true,
+  "permute_raw_hello":    true
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `raw_client_hello` | string | Base64 of a captured ClientHello, starting at the TLS record header. Everything it contains goes on the wire as captured. |
+| `raw_psk_client_hello` | string | The same client's resumption-shaped hello. Without it a resuming session sends a first-handshake shape with a ticket bolted on, which that client never sends. |
+| `allow_blunt_mimicry` | bool | Passes through extensions this library has no model for. Without it an unmodelled extension is a load-time error, which is how a captured curl hello fails. |
+| `permute_raw_hello` | bool | Shuffles the extension order per connection. |
+
+`permute_raw_hello` has to be declared because it cannot be detected. A capture is
+one connection, so its extension order is a single sample, and nothing in the
+bytes says whether that client would have ordered them differently next time.
+Chromium reshuffles on every handshake; NSS, Apple's stack and Go do not. Leave it
+off for a captured curl or Firefox, turn it on for a captured Chrome, or the
+preset either freezes an order the real client varies or invents variation the
+real client never has.
+
+It is ignored when `allow_blunt_mimicry` is set. That mode exists to pass through
+extensions with no model behind them, and moving something the library cannot
+parse risks putting it where the protocol does not allow.
+
+Captures are validated when the preset loads, so an unusable one is a named error
+rather than a handshake failure on the first request.
+
+### `trust_anchors`
+
+```json
+"tls": { "trust_anchors": ["82df130201", "839a648c9b2d0107"] }
+```
+
+Hex-encoded certificate authority identifiers for the trust anchors extension
+(`0xCA34`), 1 to 255 bytes each. Chrome 152 advertises 28 of them. The order is
+reshuffled per connection, because the browser's own order is not stable: it comes
+from iterating a hash container that is reseeded whenever the configuration is
+copied, which happens once per connection.
+
+### `psk_ja3`
+
+The JA3-mode counterpart of `psk_client_hello`: the resumption-shaped JA3 string
+for the same client. Without it a JA3 preset cannot resume, because a first
+capture never contains extension 41.
 
 ### `ja3_extras` shape
 
@@ -229,6 +283,43 @@ How header compression and stream priorities behave on the wire.
 | `disable_cookie_split` | bool | When true, the `Cookie:` header is sent as one line instead of split into multiple HPACK entries. |
 | `hpack_never_index` | string[] | Lowercase header names that must be sent without HPACK indexing. |
 
+### `hpack_header_order_subresource`
+
+A second header order, used for every request that is not a top-level navigation.
+
+```json
+"http2": {
+  "hpack_header_order":             ["sec-ch-ua", "sec-ch-ua-mobile", "..."],
+  "hpack_header_order_subresource": ["sec-ch-ua-platform", "user-agent", "..."]
+}
+```
+
+Chrome builds a navigation and a subresource through different code paths and the
+leading block comes out differently. A navigation leads with the three
+low-entropy client hints, then `upgrade-insecure-requests`, then `user-agent`. A
+subresource leads with the platform hint and `user-agent`, then the other two
+hints, carries a `Referer`, and sends neither `upgrade-insecure-requests` nor
+`sec-fetch-user`.
+
+The transport picks between the two using the request's `sec-fetch-dest`, the same
+field `priority_table` keys off. `document` and `iframe` take the navigation
+order; everything else takes this one. Omit the field and a preset uses
+`hpack_header_order` for both, which is what a client with one order wants.
+
+Measured across script, style, image, font, manifest and `fetch()` requests, all
+six produce a single order, so this is a two-way split rather than one order per
+resource type.
+
+### Other `http2` fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `hpack_representation` | object | Per-header-name override of the HPACK representation: `"incremental"`, `"without"`, `"never"` or `"default"`. Deltas only; browser profiles leave it empty. |
+| `data_frame_max_size` | uint32 | Caps the DATA frame payload this profile sends. Omitted derives it from the client family: 16375 for Chrome, the peer's advertised size otherwise. Chrome's cap exists so header plus payload occupy exactly one TLS record. |
+| `preface_ping_idle_ms` | uint32 | When a connection has been idle this long, the next request on it carries a PING alongside. Omitted or `0` sends none. Chrome uses `10000`. |
+| `preface_ping_hang_ms` | uint32 | The companion hang interval. |
+| `idle_ping_ms` | uint32 | Enables a periodic health-check PING, which no browser sends. Omitted or `0` means off, which is what a browser profile wants. |
+
 ### `priority_table`
 
 Maps `sec-fetch-dest` values (`document`, `image`, `script`, `style`, `font`, and so on) to per-resource priority settings. When populated, the transport emits a per-request RFC 7540 stream weight derived from `urgency` plus an RFC 9218 `priority:` header on every request, keyed off the request's `sec-fetch-dest`.
@@ -304,6 +395,18 @@ Omit a field (nil) and the quic-go default applies. The library only writes a sl
 
 ---
 
+### `quic_connection_options`
+
+```json
+"http3": { "quic_connection_options": ["ORIG"] }
+```
+
+The Google connection-option tags sent in the QUIC transport parameters. Chrome
+currently sends `["ORIG"]`, and this is a preset key rather than a constant
+because the value comes from a server-side experiment and can change without a
+Chrome release. An explicitly empty list sends none; omitting the field entirely
+falls back to the default.
+
 ## `headers` object
 
 The HTTP request header bundle. User-Agent, all the named values, and the exact wire order they're sent in.
@@ -333,6 +436,36 @@ The HTTP request header bundle. User-Agent, all the named values, and the exact 
 Order matters. HTTP/2 and HTTP/3 don't enforce header order on the receiving side, but bot-detection products fingerprint it. Real Chrome and real Firefox sit far apart on this dimension.
 
 ---
+
+## `client_hints` object
+
+The high-entropy UA client hints, sent only after an origin asks for them with
+`Accept-CH`. Top level, alongside `headers`, since they are a separate negotiation
+rather than part of the default header block.
+
+```json
+"client_hints": {
+  "full_version_list": "\"Chromium\";v=\"152.0.7977.64\", ...",
+  "platform_version":  "19.0.0",
+  "arch":              "x86",
+  "bitness":           "64",
+  "model":             "",
+  "wow64":             "?0"
+}
+```
+
+| Field | Header |
+|---|---|
+| `full_version_list` | `sec-ch-ua-full-version-list` |
+| `platform_version` | `sec-ch-ua-platform-version` |
+| `arch` | `sec-ch-ua-arch` |
+| `bitness` | `sec-ch-ua-bitness` |
+| `model` | `sec-ch-ua-model` |
+| `wow64` | `sec-ch-ua-wow64` |
+
+`full_version_list` is worth taking from a real capture rather than composing:
+it carries the exact build number, which cannot be derived from the major
+version. `model` is empty on desktop and set on Android.
 
 ## `tcp` object
 
@@ -368,8 +501,37 @@ Feature flags that gate which protocols the preset participates in.
 | Field | Type | Notes |
 |---|---|---|
 | `http3` | bool | Whether the preset advertises HTTP/3 support. When false, the runtime won't try QUIC even if the host advertises it via Alt-Svc. |
+| `h3` | bool | Alias for `http3`. |
+| `h2` | bool | When false, auto mode skips HTTP/2 and goes straight to HTTP/1.1. |
 
 ---
+
+## Strict loading
+
+The loader ignores keys it does not recognise. That is right for forward
+compatibility, so a preset written for a newer version still loads on an older
+one, and wrong for a typo.
+
+It is also the quietest failure the loader has. A misspelled key does not fail;
+it leaves that part of the preset at whatever the inheritance chain supplied. A
+file written to mirror one client can go on the wire as another, with no error
+anywhere. Every other kind of mistake announces itself.
+
+Two functions cover it:
+
+- `UnknownPresetFields(data)` returns every key nothing models, as dotted paths
+  like `preset.tls.cipher_suits`. It walks the whole document rather than stopping
+  at the first one, so a run reports every typo at once.
+- `LoadPresetFromJSONStrict(data)` refuses such a preset outright, naming the
+  keys.
+
+Use the strict form when a preset is meant to reproduce a specific client exactly
+and a silently ignored key would mean shipping the wrong fingerprint. The lenient
+`LoadPresetFromJSON` stays the default.
+
+Free-form maps end the walk, since keys under them are your data rather than
+schema: custom header names and `hpack_representation` entries are never reported
+as unknown fields. Every preset shipped with the library passes strict loading.
 
 ## Round-trip guarantee
 
@@ -378,7 +540,7 @@ The chain `Describe -> LoadPresetFromJSON -> BuildPreset -> Describe` produces b
 ```go
 import "github.com/sardanioss/httpcloak/fingerprint"
 
-orig, _ := fingerprint.Describe("chrome-148-windows")
+orig, _ := fingerprint.Describe("chrome-152-windows")
 pf, _ := fingerprint.LoadPresetFromJSON([]byte(orig))
 rebuilt, _ := fingerprint.BuildPreset(pf.Preset)
 fingerprint.Register(rebuilt.Name+"-rt", rebuilt)
@@ -386,7 +548,7 @@ again, _ := fingerprint.Describe(rebuilt.Name+"-rt")
 // orig == again, modulo the renamed `name` field
 ```
 
-The verified spot-check (chrome-148-windows, firefox-148, safari-18-ios) shows zero diff beyond the rename.
+The verified spot-check (chrome-152-windows, firefox-148, safari-18-ios) shows zero diff beyond the rename.
 
 ---
 
@@ -428,14 +590,14 @@ fingerprint.Register(preset.Name, preset)
 
 ## A complete minimal example
 
-A real preset that swaps only the User-Agent on top of `chrome-148-windows`:
+A real preset that swaps only the User-Agent on top of `chrome-152-windows`:
 
 ```json
 {
   "version": 1,
   "preset": {
-    "name": "chrome-148-windows-headless",
-    "based_on": "chrome-148-windows",
+    "name": "chrome-152-windows-headless",
+    "based_on": "chrome-152-windows",
     "headers": {
       "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/148.0.0.0 Safari/537.36"
     }

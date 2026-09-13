@@ -34,6 +34,8 @@ import (
 	"net"
 	"net/textproto"
 	"net/url"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -135,6 +137,12 @@ type MultipartField struct {
 func BuildMultipart(fields []MultipartField) ([]byte, string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
+	// Chrome-shaped boundary. Without this, Go emits 60 lowercase hex
+	// characters with no leading dashes, which no browser produces and which
+	// travels in cleartext in the content-type request header.
+	if err := w.SetBoundary(fingerprint.MultipartBoundary()); err != nil {
+		return nil, "", err
+	}
 	for _, f := range fields {
 		if f.Filename != "" {
 			ct := f.ContentType
@@ -168,8 +176,30 @@ type Request struct {
 	Method  string
 	URL     string
 	Headers map[string][]string // Multi-value headers (matches http.Header)
-	Body    io.Reader           // Streaming body for uploads
-	Timeout time.Duration
+
+	// ExactHeaders, when non-empty, replaces the whole header pipeline for this
+	// request. The pairs go on the wire in the order and casing given, and
+	// nothing is added: no preset block, no client hints, no Sec-Fetch
+	// inference, and no alphabetical tail for names the preset does not know.
+	//
+	// A name may repeat, and each occurrence keeps its own position. Listing
+	// cookie, accept, cookie puts the accept between the two cookies on all
+	// three protocols, which a map of name to values cannot express and is the
+	// shape a captured request routinely has.
+	//
+	// Use it to reproduce a captured request exactly. It is an escape hatch:
+	// the caller takes on the entire request shape, including headers a browser
+	// would always send. Headers is ignored when this is set, and so is the
+	// session cookie jar, which would otherwise append a Cookie of its own.
+	//
+	// Host on HTTP/1.1 and the pseudo-header block on HTTP/2 and HTTP/3 are
+	// still written for you, because they are protocol framing rather than
+	// caller headers. Connection is not: a capture that carries none cannot
+	// have one added back, and HTTP/1.1 keeps the connection alive by default
+	// anyway. List it yourself to send it.
+	ExactHeaders []fingerprint.HeaderPair
+	Body         io.Reader // Streaming body for uploads
+	Timeout      time.Duration
 
 	// GetBody returns a fresh reader over the same body for a request that has
 	// to go on the wire more than once: a 307 or 308 redirect hop, or a retried
@@ -219,6 +249,18 @@ type Request struct {
 	// but suppresses the high-entropy hints (full-version-list, arch,
 	// platform-version, bitness, model, wow64) for this single request.
 	DisableHighEntropyClientHints bool
+
+	// DisableRedirectReferer, when true, stops a Referer being added on redirect
+	// hops. By default httpcloak synthesises one per Chrome's default
+	// strict-origin-when-cross-origin policy: the full previous URL same-origin,
+	// the origin alone cross-origin, and nothing at all on an https to http
+	// downgrade. That is what a browser does, so leave this off unless you are
+	// mirroring a client that sends no Referer.
+	//
+	// When set, no Referer reaches the next hop at all, including one you set on
+	// the original request, since forwarding that would leak the pre-redirect URL
+	// to the new host.
+	DisableRedirectReferer bool
 
 	// HeaderOrder, when non-empty, sets the header order for this single request
 	// and overrides whatever SetHeaderOrder installed on the session. Nothing is
@@ -298,10 +340,34 @@ type RedirectInfo struct {
 type Response struct {
 	StatusCode int
 	Headers    map[string][]string // Multi-value headers (matches http.Header)
-	Body       io.ReadCloser       // Streaming body - call Close() when done
-	FinalURL   string
-	Protocol   string
-	History    []*RedirectInfo
+
+	// HeaderOrder is the order the server sent its headers in, lowercase, one
+	// entry per occurrence. Headers is a map and cannot carry order, so code
+	// that relays this response onward would otherwise emit a different
+	// sequence than the origin did.
+	//
+	// Nil when the protocol path did not record one: HTTP/2 and HTTP/3 decode
+	// an ordered field list and record it for free, while HTTP/1.1 reads
+	// through textproto, which canonicalises the names and drops the order.
+	HeaderOrder []string
+
+	// HeaderCasing is the response header names as the server spelled them, in
+	// arrival order. HTTP/1.1 only: HTTP/2 and HTTP/3 require lowercase on the
+	// wire, so there is no casing to report and this is nil. Also nil when the
+	// header block was not fully buffered when the response was read. Headers is
+	// populated either way.
+	HeaderCasing []string
+
+	// Trailer is the trailing header block sent after the body, lowercase-keyed,
+	// nil when there was none. gRPC puts the call's real status here rather than
+	// in the response headers, so a client that ignores it reports every failed
+	// call as a 200.
+	Trailer map[string][]string
+
+	Body     io.ReadCloser // Streaming body - call Close() when done
+	FinalURL string
+	Protocol string
+	History  []*RedirectInfo
 
 	// bodyBytes caches the body after reading
 	bodyBytes []byte
@@ -945,6 +1011,19 @@ type CustomFingerprint struct {
 
 	// PermuteExtensions randomly permutes the TLS extension order.
 	PermuteExtensions bool
+
+	// DelegatedCredentialAlgorithms sets extension 34. Same value vocabulary as
+	// SignatureAlgorithms. Empty keeps the Chrome defaults.
+	DelegatedCredentialAlgorithms []string
+
+	// RecordSizeLimit sets extension 28. Zero keeps the Chrome default of
+	// 0x4001. Firefox is the client that differs here.
+	RecordSizeLimit uint16
+
+	// KeyShareCurves is how many curves to send key shares for. Zero means one,
+	// which is the Chrome default; a client offering both X25519MLKEM768 and
+	// x25519 shares sends two.
+	KeyShareCurves int
 }
 
 // WithCustomFingerprint sets a custom TLS/HTTP2 fingerprint for the session.
@@ -966,12 +1045,27 @@ func WithCustomFingerprint(fp CustomFingerprint) SessionOption {
 			extras := &fingerprint.JA3Extras{
 				PermuteExtensions: fp.PermuteExtensions,
 				RecordSizeLimit:   0x4001,
+				KeyShareCurves:    fp.KeyShareCurves,
+			}
+			if fp.RecordSizeLimit != 0 {
+				extras.RecordSizeLimit = fp.RecordSizeLimit
+			}
+			if len(fp.DelegatedCredentialAlgorithms) > 0 {
+				algs, err := parseSignatureAlgorithmsStrict(fp.DelegatedCredentialAlgorithms)
+				if err != nil {
+					c.configErr = fmt.Errorf("delegated_credential_algorithms: %w", err)
+				}
+				extras.DelegatedCredentialAlgorithms = algs
 			}
 			if len(fp.ALPN) > 0 {
 				extras.ALPN = fp.ALPN
 			}
 			if len(fp.SignatureAlgorithms) > 0 {
-				extras.SignatureAlgorithms = parseSignatureAlgorithms(fp.SignatureAlgorithms)
+				algs, err := parseSignatureAlgorithmsStrict(fp.SignatureAlgorithms)
+				if err != nil {
+					c.configErr = fmt.Errorf("signature_algorithms: %w", err)
+				}
+				extras.SignatureAlgorithms = algs
 			}
 			if len(fp.CertCompression) > 0 {
 				extras.CertCompAlgs = parseCertCompression(fp.CertCompression)
@@ -1080,7 +1174,18 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 	} else {
 		s = session.NewSession("", sessionCfg)
 	}
-	return &Session{inner: s, configErr: cfg.configErr}
+	// An unrecognised preset name is a config error, not something to paper
+	// over. Get() answers it with chrome-146, so a single mistyped character
+	// used to put a three-version-old fingerprint on the wire with nothing said
+	// about it, which is the one failure this library exists to prevent.
+	//
+	// Deferred like the other config errors: NewSession has no error return, so
+	// it surfaces on the first request rather than at construction.
+	configErr := cfg.configErr
+	if configErr == nil && cfg.preset != "" && fingerprint.GetStrict(cfg.preset) == nil {
+		configErr = fingerprint.UnknownPresetError(cfg.preset)
+	}
+	return &Session{inner: s, configErr: configErr}
 }
 
 // toResponse converts a transport response, including its redirect history.
@@ -1105,12 +1210,15 @@ func toResponse(resp *transport.Response) *Response {
 	}
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Headers,
-		Body:       resp.Body,
-		FinalURL:   resp.FinalURL,
-		Protocol:   resp.Protocol,
-		History:    history,
+		StatusCode:  resp.StatusCode,
+		Headers:     resp.Headers,
+		HeaderOrder: resp.HeaderOrder,
+		Trailer:     resp.Trailer,
+		HeaderCasing: resp.HeaderCasing,
+		Body:        resp.Body,
+		FinalURL:    resp.FinalURL,
+		Protocol:    resp.Protocol,
+		History:     history,
 	}
 }
 
@@ -1128,6 +1236,7 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 		Method:                        req.Method,
 		URL:                           req.URL,
 		Headers:                       req.Headers,
+		ExactHeaders:                  req.ExactHeaders,
 		BodyReader:                    req.Body,
 		GetBody:                       req.GetBody,
 		TLSOnly:                       req.TLSOnly,
@@ -1135,6 +1244,7 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 		DisableConditionalCache:       req.DisableConditionalCache,
 		DisableClientHints:            req.DisableClientHints,
 		DisableHighEntropyClientHints: req.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        req.DisableRedirectReferer,
 		HeaderOrder:                   req.HeaderOrder,
 		OnRedirect:                    req.OnRedirect,
 		Timeout:                       req.Timeout,
@@ -1160,6 +1270,7 @@ func (s *Session) DoWithBody(ctx context.Context, req *Request, bodyReader io.Re
 		Method:                        req.Method,
 		URL:                           req.URL,
 		Headers:                       req.Headers,
+		ExactHeaders:                  req.ExactHeaders,
 		BodyReader:                    bodyReader,
 		GetBody:                       req.GetBody,
 		TLSOnly:                       req.TLSOnly,
@@ -1167,6 +1278,7 @@ func (s *Session) DoWithBody(ctx context.Context, req *Request, bodyReader io.Re
 		DisableConditionalCache:       req.DisableConditionalCache,
 		DisableClientHints:            req.DisableClientHints,
 		DisableHighEntropyClientHints: req.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        req.DisableRedirectReferer,
 		HeaderOrder:                   req.HeaderOrder,
 		OnRedirect:                    req.OnRedirect,
 		Timeout:                       req.Timeout,
@@ -1399,9 +1511,23 @@ func (s *Session) Fork(n int) []*Session {
 	return forks
 }
 
-// Close closes the session and releases resources
+// Close closes the session and releases resources immediately. Any request
+// still in flight, including a body still being read, is interrupted.
 func (s *Session) Close() {
 	s.inner.Close()
+}
+
+// CloseGraceful closes the session without interrupting requests that are in
+// flight. The session stops accepting new requests at once; idle connections
+// close now, and a connection still delivering a response body closes when that
+// body is finished. It returns immediately, and calling Close afterwards forces
+// anything still draining. This is the right call when retiring a long-lived
+// session that other goroutines may still be reading responses from.
+//
+// HTTP/1.1 and HTTP/2 connections drain as described. HTTP/3 connections are
+// closed immediately, as by Close.
+func (s *Session) CloseGraceful() {
+	s.inner.CloseGraceful()
 }
 
 // Refresh closes all connections but keeps TLS session caches and cookies intact.
@@ -1479,13 +1605,32 @@ func UnmarshalSessionWithOptions(data []byte, opts *SessionLoadOptions) (*Sessio
 // StreamResponse represents a streaming HTTP response where the body
 // is read incrementally. Use this for large file downloads.
 type StreamResponse struct {
-	StatusCode    int
-	Headers       map[string][]string
+	StatusCode int
+	Headers    map[string][]string
+
+	// HeaderOrder is the order the server sent its headers in, lowercase. See
+	// Response.HeaderOrder; nil on HTTP/1.1.
+	HeaderOrder []string
+
 	FinalURL      string
 	Protocol      string
 	ContentLength int64 // -1 if unknown (chunked encoding)
 
 	inner *transport.StreamResponse
+}
+
+// Trailer returns the trailing header block, lowercase-keyed, or nil when there
+// was none.
+//
+// Call it after the body has been read to EOF. On a streamed response the
+// trailers have not arrived before then, which is why this is a method rather
+// than the plain field it is on the buffered Response. gRPC is the case that
+// needs it: the call's real status arrives in the trailers, not the headers.
+func (r *StreamResponse) Trailer() map[string][]string {
+	if r == nil || r.inner == nil {
+		return nil
+	}
+	return r.inner.Trailer()
 }
 
 // Read reads data from the response body
@@ -1522,6 +1667,7 @@ func (s *Session) DoStream(ctx context.Context, req *Request) (*StreamResponse, 
 		Method:                        req.Method,
 		URL:                           req.URL,
 		Headers:                       req.Headers,
+		ExactHeaders:                  req.ExactHeaders,
 		BodyReader:                    req.Body,
 		GetBody:                       req.GetBody,
 		TLSOnly:                       req.TLSOnly,
@@ -1529,6 +1675,7 @@ func (s *Session) DoStream(ctx context.Context, req *Request) (*StreamResponse, 
 		DisableConditionalCache:       req.DisableConditionalCache,
 		DisableClientHints:            req.DisableClientHints,
 		DisableHighEntropyClientHints: req.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        req.DisableRedirectReferer,
 		HeaderOrder:                   req.HeaderOrder,
 		Timeout:                       req.Timeout,
 	}
@@ -1541,6 +1688,7 @@ func (s *Session) DoStream(ctx context.Context, req *Request) (*StreamResponse, 
 	return &StreamResponse{
 		StatusCode:    resp.StatusCode,
 		Headers:       resp.Headers,
+		HeaderOrder:   resp.HeaderOrder,
 		FinalURL:      resp.FinalURL,
 		Protocol:      resp.Protocol,
 		ContentLength: resp.ContentLength,
@@ -1599,28 +1747,68 @@ func NewManager() *Manager {
 	return session.NewManager()
 }
 
-// parseSignatureAlgorithms converts string names to tls.SignatureScheme values.
-func parseSignatureAlgorithms(names []string) []tls.SignatureScheme {
-	m := map[string]tls.SignatureScheme{
-		"ecdsa_secp256r1_sha256": tls.ECDSAWithP256AndSHA256,
-		"ecdsa_secp384r1_sha384": tls.ECDSAWithP384AndSHA384,
-		"ecdsa_secp521r1_sha512": tls.ECDSAWithP521AndSHA512,
-		"rsa_pss_rsae_sha256":    tls.PSSWithSHA256,
-		"rsa_pss_rsae_sha384":    tls.PSSWithSHA384,
-		"rsa_pss_rsae_sha512":    tls.PSSWithSHA512,
-		"rsa_pkcs1_sha256":       tls.PKCS1WithSHA256,
-		"rsa_pkcs1_sha384":       tls.PKCS1WithSHA384,
-		"rsa_pkcs1_sha512":       tls.PKCS1WithSHA512,
-	}
+// signatureSchemeNames is the spelling vocabulary for signature algorithms.
+//
+// It is not exhaustive and cannot be: TLS gains codepoints faster than a name
+// table gets updated, and this library's job is to reproduce whatever a real
+// client sent. parseSignatureAlgorithmsStrict therefore also accepts a raw
+// codepoint, so a caller is never blocked on a name being added here.
+var signatureSchemeNames = map[string]tls.SignatureScheme{
+	"ecdsa_secp256r1_sha256": tls.ECDSAWithP256AndSHA256,
+	"ecdsa_secp384r1_sha384": tls.ECDSAWithP384AndSHA384,
+	"ecdsa_secp521r1_sha512": tls.ECDSAWithP521AndSHA512,
+	"rsa_pss_rsae_sha256":    tls.PSSWithSHA256,
+	"rsa_pss_rsae_sha384":    tls.PSSWithSHA384,
+	"rsa_pss_rsae_sha512":    tls.PSSWithSHA512,
+	"rsa_pkcs1_sha256":       tls.PKCS1WithSHA256,
+	"rsa_pkcs1_sha384":       tls.PKCS1WithSHA384,
+	"rsa_pkcs1_sha512":       tls.PKCS1WithSHA512,
+	// Present in real captures and previously unspellable.
+	"rsa_pkcs1_sha1": 0x0201,
+	"ecdsa_sha1":     0x0203,
+	"ed25519":        0x0807,
+	"ed448":          0x0808,
+	// draft-ietf-tls-mldsa. Chrome 150+ sends these on TCP but not on QUIC,
+	// which is why presets carry separate TCP and QUIC sig-alg lists.
+	"mldsa44": 0x0904,
+	"mldsa65": 0x0905,
+	"mldsa87": 0x0906,
+}
+
+// parseSignatureAlgorithmsStrict converts names or raw codepoints to schemes,
+// reporting anything it does not understand.
+//
+// The previous version silently dropped unknown names, which is the worst
+// failure mode for a fingerprinting library: the request succeeds, the
+// extension is short, and nothing says why. A caller asking for ML-DSA got an
+// empty list and a Chrome 146 signature_algorithms extension.
+//
+// A codepoint may be written "0x0904" or "2308"; both reach the same value.
+func parseSignatureAlgorithmsStrict(names []string) ([]tls.SignatureScheme, error) {
 	var result []tls.SignatureScheme
 	for _, name := range names {
-		if scheme, ok := m[strings.ToLower(name)]; ok {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if scheme, ok := signatureSchemeNames[key]; ok {
 			result = append(result, scheme)
+			continue
 		}
+		if n, err := strconv.ParseUint(key, 0, 16); err == nil {
+			result = append(result, tls.SignatureScheme(n))
+			continue
+		}
+		return nil, fmt.Errorf("unknown signature algorithm %q: use a known name or a "+
+			"codepoint such as 0x0904", name)
 	}
 	if len(result) == 0 {
-		return nil
+		return nil, nil
 	}
+	return result, nil
+}
+
+// parseSignatureAlgorithms is the lenient form kept for callers that cannot
+// report an error. Prefer parseSignatureAlgorithmsStrict.
+func parseSignatureAlgorithms(names []string) []tls.SignatureScheme {
+	result, _ := parseSignatureAlgorithmsStrict(names)
 	return result
 }
 
@@ -1641,4 +1829,37 @@ func parseCertCompression(names []string) []tls.CertCompressionAlgo {
 		return nil
 	}
 	return result
+}
+
+// TrimMemory returns freed memory to the operating system and blocks until it
+// has.
+//
+// Closing a session makes its memory collectable, which is a different thing
+// from giving it back. Go's scavenger releases pages lazily and on Linux it
+// does so with MADV_FREE, which lets the kernel reclaim the pages under
+// pressure but leaves them counted against the process until it does. So RSS
+// stays flat, or drifts slightly up, long after the sessions are gone. Measured
+// over 150 sessions each doing a real TLS request: 85MB resident, and closing
+// every one of them then forcing a garbage collection moved it by less than
+// three megabytes, in the wrong direction.
+//
+// This is a ceiling rather than a leak. It is bounded by how many sessions are
+// alive at once, and a long-running process reuses those pages for the next
+// batch instead of growing without limit. Reach for this when the ceiling
+// itself is the problem: a worker that has just finished a large batch and will
+// now sit idle, a process sharing a memory-capped container with something
+// else, or a fork-per-job model measuring RSS.
+//
+// It is deliberately NOT called by Close, and that is worth saying plainly
+// because it looks like the obvious home for it. This stops the world for the
+// length of a full collection, so a pool closing sessions steadily would pay
+// that on every single one, and the cost lands on exactly the workloads that
+// close sessions most. Calling it once between batches costs the same one
+// collection and gives back the same memory.
+//
+// It is process-wide, not per session, which is why it is a package function
+// and not a method: the runtime has one heap and this hands back all of the
+// free part of it, whoever allocated it.
+func TrimMemory() {
+	debug.FreeOSMemory()
 }

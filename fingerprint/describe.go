@@ -2,8 +2,10 @@ package fingerprint
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	tls "github.com/sardanioss/utls"
 )
@@ -111,6 +113,35 @@ func flattenTLS(p *Preset) (*TLSSpec, error) {
 		out.QUICPSKClientHello = name
 	}
 
+	// The per-protocol signature_algorithms overrides. These were missing, so a
+	// describe of any Chrome 150 or later preset dropped its ML-DSA codepoints
+	// and a reload produced a Chrome 149 shaped sig-algs list: 11 algorithms
+	// became 0. The documented round-trip check did not catch it, because both
+	// describes omit the key and so JSON1 == JSON2 holds vacuously while the
+	// two PRESETS differ.
+	//
+	// The JA3 path carries its own inside JA3Extras and returns above, so this
+	// is reached only for the ClientHelloID path, which is where these apply.
+	if len(p.SignatureAlgorithms) > 0 {
+		out.SignatureAlgorithms = make([]uint16, len(p.SignatureAlgorithms))
+		for i, s := range p.SignatureAlgorithms {
+			out.SignatureAlgorithms[i] = uint16(s)
+		}
+	}
+	if len(p.QUICSignatureAlgorithms) > 0 {
+		out.QUICSignatureAlgorithms = make([]uint16, len(p.QUICSignatureAlgorithms))
+		for i, s := range p.QUICSignatureAlgorithms {
+			out.QUICSignatureAlgorithms[i] = uint16(s)
+		}
+	}
+
+	if len(p.TrustAnchors) > 0 {
+		out.TrustAnchors = make([]string, len(p.TrustAnchors))
+		for i, ta := range p.TrustAnchors {
+			out.TrustAnchors[i] = hex.EncodeToString(ta)
+		}
+	}
+
 	if out.ClientHello == "" && out.JA3 == "" {
 		// Preset has no TLS configuration at all. Drop the TLS section.
 		return nil, nil
@@ -210,6 +241,11 @@ func flattenHTTP2(p *Preset) *HTTP2Spec {
 
 	// H2Config: dump resolved values via getters. nil-safe.
 	out.HPACKHeaderOrder = append([]string(nil), p.H2HeaderOrder()...)
+	// Emitted only when the preset actually carries one, so describing a client
+	// that uses a single order for every request shape does not invent a second.
+	if p.H2Config != nil && len(p.H2Config.HPACKHeaderOrderSubresource) > 0 {
+		out.HPACKHeaderOrderSubresource = append([]string(nil), p.H2Config.HPACKHeaderOrderSubresource...)
+	}
 	policy := p.H2HPACKIndexingPolicy()
 	out.HPACKIndexingPolicy = &policy
 	out.HPACKNeverIndex = append([]string(nil), p.H2HPACKNeverIndex()...)
@@ -217,6 +253,20 @@ func flattenHTTP2(p *Preset) *HTTP2Spec {
 	out.StreamPriorityMode = &priorityMode
 	disableCookie := p.H2DisableCookieSplit()
 	out.DisableCookieSplit = &disableCookie
+
+	// Emit the RESOLVED values, not just the explicit ones. A Chrome preset
+	// carries 16375 and a 10 second preface ping by family or by factory; if
+	// describe skipped them, an export-and-reload would silently lose both and
+	// the strict round-trip test would stay green, because both describes would
+	// omit the key symmetrically.
+	dataFrameMax := p.H2DataFrameMaxSize()
+	out.DataFrameMaxSize = &dataFrameMax
+	prefaceIdle := uint32(p.H2PrefacePingIdle() / time.Millisecond)
+	out.PrefacePingIdleMs = &prefaceIdle
+	prefaceHang := uint32(p.H2PrefacePingHang() / time.Millisecond)
+	out.PrefacePingHangMs = &prefaceHang
+	idlePing := uint32(p.H2IdlePing() / time.Millisecond)
+	out.IdlePingMs = &idlePing
 
 	if so := p.H2SettingsOrder(); so != nil {
 		out.SettingsOrder = append([]uint16(nil), so...)
@@ -296,6 +346,19 @@ func flattenHTTP3(p *Preset) *HTTP3Spec {
 	out.MaxResponseHeaderBytes = &maxRespHdr
 	grease := p.H3SendGreaseFrames()
 	out.SendGreaseFrames = &grease
+
+	// Only emitted when set explicitly, for the same reason as the
+	// flow-control pair below, plus one specific to this key: the parameter it
+	// feeds is sent only for Chromium QUIC identities. Emitting the resolved
+	// default unconditionally would put ["ORIG"] in a Firefox preset's describe
+	// output, and a user who edited that and reloaded would see the key vanish
+	// with no error. That is the failure data_frame_max_size had.
+	if p.H3Config != nil && p.H3Config.QUICConnectionOptions != nil {
+		src := *p.H3Config.QUICConnectionOptions
+		v := make([]string, len(src))
+		copy(v, src)
+		out.QUICConnectionOptions = &v
+	}
 
 	// Optional flow-control overrides — only emit when set explicitly so
 	// presets that leave them at quic-go defaults (the vast majority) don't

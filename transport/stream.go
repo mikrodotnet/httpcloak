@@ -24,9 +24,14 @@ import (
 type StreamResponse struct {
 	StatusCode int
 	Headers    map[string][]string // Multi-value headers
-	FinalURL   string
-	Timing     *protocol.Timing
-	Protocol   string // "h1", "h2", or "h3"
+
+	// HeaderOrder is the order the peer sent its headers in, lowercase. See
+	// Response.HeaderOrder; nil on HTTP/1.1.
+	HeaderOrder []string
+
+	FinalURL string
+	Timing   *protocol.Timing
+	Protocol string // "h1", "h2", or "h3"
 
 	// ContentLength is the expected total size (-1 if unknown/chunked)
 	ContentLength int64
@@ -43,6 +48,31 @@ type StreamResponse struct {
 	// selects on it so its goroutine unblocks instead of leaking when a caller
 	// abandons iteration and closes the response.
 	done <-chan struct{}
+
+	// httpResp is kept only so Trailer() can read the trailing block. On a
+	// streamed response the trailers are not known when the header block
+	// arrives, so they cannot be a plain field the way they are on a buffered
+	// Response; they have to be read back after the body reaches EOF.
+	httpResp *http.Response
+}
+
+// Trailer returns the trailing header block, lowercase-keyed, or nil when the
+// response carried none.
+//
+// Call it only after the body has been read to EOF. Before that the trailing
+// block has not arrived and this returns nil, or on HTTP/1.1 the declared names
+// with no values, which is what the protocol makes available at that point.
+// This is the streaming counterpart of Response.Trailer, which can be a plain
+// field because that path buffers the body first.
+//
+// gRPC is the case that needs it: the call's real status arrives here, not in
+// the response headers, so a streamed gRPC call read without this reports every
+// failure as a 200.
+func (r *StreamResponse) Trailer() map[string][]string {
+	if r == nil || r.httpResp == nil {
+		return nil
+	}
+	return buildTrailerMap(r.httpResp.Trailer)
 }
 
 // Read reads data from the response body
@@ -385,19 +415,9 @@ func (t *Transport) doStreamHTTP1(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints)
+	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	// Override with custom headers (multi-value support)
-	// Use Set for first value to replace preset headers, Add for additional values
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
-	}
+	mergeCallerHeaders(httpReq, req)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -428,6 +448,8 @@ func (t *Transport) doStreamHTTP1(ctx context.Context, req *Request) (*StreamRes
 	return &StreamResponse{
 		StatusCode:    resp.StatusCode,
 		Headers:       headers,
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		httpResp:      resp,
 		FinalURL:      req.URL,
 		Timing:        timing,
 		Protocol:      "h1",
@@ -493,19 +515,9 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers, req.DisableClientHints)
+	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	// Override with custom headers (multi-value support)
-	// Use Set for first value to replace preset headers, Add for additional values
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
-	}
+	mergeCallerHeaders(httpReq, req)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -534,6 +546,8 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 	return &StreamResponse{
 		StatusCode:    resp.StatusCode,
 		Headers:       headers,
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		httpResp:      resp,
 		FinalURL:      req.URL,
 		Timing:        timing,
 		Protocol:      "h2",
@@ -599,19 +613,9 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers, req.DisableClientHints)
+	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	// Override with custom headers (multi-value support)
-	// Use Set for first value to replace preset headers, Add for additional values
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
-	}
+	mergeCallerHeaders(httpReq, req)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -640,6 +644,8 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 	return &StreamResponse{
 		StatusCode:    resp.StatusCode,
 		Headers:       headers,
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		httpResp:      resp,
 		FinalURL:      req.URL,
 		Timing:        timing,
 		Protocol:      "h3",

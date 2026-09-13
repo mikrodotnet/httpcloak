@@ -18,9 +18,9 @@ import (
 	http "github.com/sardanioss/http"
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
+	"github.com/sardanioss/httpcloak/internal/h2build"
 	"github.com/sardanioss/httpcloak/proxy"
 	"github.com/sardanioss/net/http2"
-	"github.com/sardanioss/net/http2/hpack"
 	tls "github.com/sardanioss/utls"
 	utls "github.com/sardanioss/utls"
 	"golang.org/x/sync/singleflight"
@@ -73,15 +73,18 @@ type HTTP2Transport struct {
 	localAddr            string // Local IP to bind outgoing connections
 
 	// Cleanup
-	stopCleanup chan struct{}
-	closed      bool
+	stopCleanup     chan struct{}
+	stopCleanupOnce sync.Once
+	// closed means the transport takes no new requests. Set by both Close and
+	// CloseGraceful; the latter leaves connections draining in t.retired.
+	closed bool
 }
 
 // persistentConn represents a persistent HTTP/2 connection
 type persistentConn struct {
-	host            string
-	tlsConn         *utls.UConn
-	h2Conn          *http2.ClientConn
+	host           string
+	tlsConn        *utls.UConn
+	h2Conn         *http2.ClientConn
 	createdAt      time.Time
 	lastUsedAt     time.Time
 	useCount       int64
@@ -89,9 +92,19 @@ type persistentConn struct {
 	closeRequested bool  // close as soon as the last in-flight request finishes
 	closed         bool  // close() has already run
 	sessionResumed bool  // True if TLS session was resumed (faster handshake)
-	tlsVersion     uint16
-	cipherSuite    uint16
-	mu             sync.Mutex
+
+	// Measured setup phases in milliseconds, filled during creation. These
+	// replace a fabricated breakdown: the response path used to report
+	// DNSLookup, TCPConnect and TLSHandshake as fixed fractions of FirstByte
+	// (0.2, 0.3 and 0.5 of 70% of it), which are invented numbers in a public
+	// API field. A phase that is not measured on a path stays zero, which is
+	// the same value the struct already documents for "cached or reused".
+	dnsMs       float64
+	tcpMs       float64
+	tlsMs       float64
+	tlsVersion  uint16
+	cipherSuite uint16
+	mu          sync.Mutex
 
 	// lastProgress is the unix-nano timestamp of the most recent body read.
 	// Kept outside the mutex because it is touched on every Read. Only
@@ -148,7 +161,9 @@ func (t *HTTP2Transport) retire(conn *persistentConn) {
 	conn.mu.Unlock()
 
 	if !deferred {
-		conn.close()
+		// Off the caller's goroutine, like every other shutdown path here: a
+		// TLS close can stall for up to 250ms on an unresponsive peer.
+		go conn.close()
 		return
 	}
 
@@ -249,26 +264,29 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	crand.Read(seedBytes[:])
 	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
 
-	// Check if PSK spec is available for this preset, custom JA3, or preset JA3
-	hasPSKSpec := preset.PSKClientHelloID.Client != ""
-	if !hasPSKSpec && config != nil && config.CustomJA3 != "" {
-		hasPSKSpec = fingerprint.JA3HasExtension(config.CustomJA3, "41")
+	// Whether this preset can produce a resumption-shaped ClientHello at all.
+	//
+	// This used to ask whether the JA3 string contained extension 41. That can
+	// only be true of a JA3 captured mid-resumption, and a first capture never
+	// is, so a JA3 preset always reported "no PSK" and never resumed. Asking the
+	// preset what it actually carries removes the guess.
+	customJA3 := ""
+	if config != nil {
+		customJA3 = config.CustomJA3
 	}
-	if !hasPSKSpec && preset.JA3 != "" {
-		hasPSKSpec = fingerprint.JA3HasExtension(preset.JA3, "41")
-	}
+	hasPSKSpec := fingerprint.HasPSKVariant(preset, customJA3)
 
 	t := &HTTP2Transport{
-		preset:         preset,
-		dnsCache:       dnsCache,
-		proxy:          proxy,
-		config:         config,
-		conns:          make(map[string]*persistentConn),
-		sessionCache:   sessionCache,
-		shuffleSeed:    shuffleSeed,
-		hasPSKSpec:     hasPSKSpec,
-		maxIdleTime: 90 * time.Second,
-		maxConnAge:  5 * time.Minute,
+		preset:       preset,
+		dnsCache:     dnsCache,
+		proxy:        proxy,
+		config:       config,
+		conns:        make(map[string]*persistentConn),
+		sessionCache: sessionCache,
+		shuffleSeed:  shuffleSeed,
+		hasPSKSpec:   hasPSKSpec,
+		maxIdleTime:  90 * time.Second,
+		maxConnAge:   5 * time.Minute,
 		// A response body that has not produced a single byte for this long is
 		// treated as abandoned by its caller, so the connection can be
 		// reclaimed. Without a bound here, a caller that never closes a body
@@ -327,12 +345,35 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// fires it once the count reaches zero.
 		conn.release()
 
-		// Connection might be dead, remove it and retry once
+		// Connection might be dead, remove it before deciding anything.
 		t.removeConn(key)
 
 		// Don't retry if context is already done (e.g. timeout expired)
 		if req.Context().Err() != nil {
 			return nil, req.Context().Err()
+		}
+
+		// Ask whether this is a failure worth replaying, and get the request
+		// to replay with, rather than blindly re-sending the same one.
+		//
+		// Two things were wrong with re-sending it. The body: RoundTrip
+		// streams it out as it writes, so the first attempt has consumed it,
+		// and the replay went out carrying the content-length it had already
+		// computed with zero DATA behind it. That is malformed under RFC 9113
+		// 8.1.1, it is trivially visible to the server, and it is a silent
+		// correctness bug in its own right, because every retried request with
+		// a body lost the body. The H1 path next door has had this right, with
+		// a comment describing the same failure.
+		//
+		// And the classification: a browser replays a refused stream or a
+		// graceful GOAWAY, and gives up on RST_STREAM(INTERNAL_ERROR) before
+		// headers, and never makes a second HTTP/2 attempt after
+		// HTTP_1_1_REQUIRED. Retrying everything produced two HEADERS arrivals
+		// where a real client produces one, on exactly the errors a server
+		// chooses to send.
+		retryReq, retryErr := http2.ShouldRetryRequest(req, err)
+		if retryErr != nil || retryReq == nil {
+			return nil, err
 		}
 
 		conn, err = t.getOrCreateConn(req.Context(), host, port, key)
@@ -344,7 +385,7 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		conn.inFlight++
 		conn.mu.Unlock()
 
-		resp, err = conn.h2Conn.RoundTrip(req)
+		resp, err = conn.h2Conn.RoundTrip(retryReq)
 		if err != nil {
 			conn.release()
 			t.removeConn(key)
@@ -610,6 +651,13 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 	var rawConn net.Conn
 	var err error
 
+	// Measured setup phases, in milliseconds. They stay zero on the proxy path,
+	// where DNS and the TCP connect happen inside the proxy dial and are not
+	// separable from here. Zero is what the Timing struct already documents for
+	// a phase that did not happen, and reporting zero is the point: these
+	// numbers used to be fabricated as fixed fractions of FirstByte.
+	var dnsMs, dnsElapsed, tcpElapsed, tlsElapsed float64
+
 	// Get the connection host (may be different for domain fronting)
 	connectHost := t.getConnectHost(host)
 
@@ -624,7 +672,9 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 	} else {
 		// Direct connection with DNS resolution and IPv4/IPv6 fallback
 		// Resolve the connection host, not request host
+		dnsStart := time.Now()
 		ips, err := t.dnsCache.ResolveAllSorted(ctx, connectHost)
+		dnsElapsed = float64(time.Since(dnsStart).Microseconds()) / 1000
 		if err != nil {
 			return nil, fmt.Errorf("DNS resolution failed: %w", err)
 		}
@@ -664,6 +714,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 		// Race the resolved addresses with a staggered start (Happy Eyeballs):
 		// an unreachable address no longer delays the next, and the fastest
 		// reachable one wins. Bounded by the dialer timeout + ctx; losers closed.
+		tcpStart := time.Now()
 		rawConn, err = staggeredRace(ctx, len(ips), 250*time.Millisecond,
 			func(rctx context.Context, idx int) (net.Conn, error) {
 				network := "tcp4"
@@ -680,6 +731,8 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 		if rawConn == nil {
 			return nil, fmt.Errorf("TCP connect failed: all connection attempts failed")
 		}
+		tcpElapsed = float64(time.Since(tcpStart).Microseconds()) / 1000
+		dnsMs = dnsElapsed
 	}
 
 	// Set TCP keepalive
@@ -691,42 +744,28 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 	// Generate fresh spec for this connection to avoid race condition
 	// utls's ApplyPreset mutates the spec (clears KeyShares.Data, etc.), so each
 	// connection needs its own copy. Use same shuffleSeed for consistent ordering.
-	var specToUse *utls.ClientHelloSpec
-	// Determine JA3 source: config.CustomJA3 takes priority, then preset.JA3
-	ja3String := ""
-	var ja3Extras *fingerprint.JA3Extras
-	if t.config != nil && t.config.CustomJA3 != "" {
-		ja3String = t.config.CustomJA3
-		ja3Extras = t.config.CustomJA3Extras
-	} else if t.preset.JA3 != "" {
-		ja3String = t.preset.JA3
-		ja3Extras = t.preset.JA3Extras
+	// One resolver for every TLS source, shared with the H1 transport. This used
+	// to be an inline if/else chain whose first arm was `if ja3String != ""`,
+	// taken unconditionally, which made the PSK arm below it unreachable for any
+	// JA3 preset. Adding raw hellos as a fourth source to that shape would have
+	// reproduced the same bug, so the decision lives in fingerprint now.
+	customJA3, customJA3Extras := "", (*fingerprint.JA3Extras)(nil)
+	if t.config != nil {
+		customJA3, customJA3Extras = t.config.CustomJA3, t.config.CustomJA3Extras
 	}
-	if ja3String != "" {
-		// JA3: parse to fresh spec each connection (ApplyPreset mutates)
-		spec, parseErr := fingerprint.ParseJA3(ja3String, ja3Extras)
-		if parseErr != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("failed to parse JA3: %w", parseErr)
-		}
-		specToUse = spec
-	} else if t.hasPSKSpec {
-		// Generate fresh PSK spec for this connection
-		if spec, err := utls.UTLSIdToSpecWithSeed(t.preset.PSKClientHelloID, t.shuffleSeed); err == nil {
-			specToUse = &spec
-		}
+	specToUse, specSource, specErr := fingerprint.ResolveClientHelloSpec(
+		t.preset, customJA3, customJA3Extras, t.hasPSKSpec, t.shuffleSeed)
+	if specErr != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("resolve client hello: %w", specErr)
 	}
-	if specToUse == nil {
-		// Generate fresh regular spec
-		if spec, err := utls.UTLSIdToSpecWithSeed(t.preset.ClientHelloID, t.shuffleSeed); err == nil {
-			specToUse = &spec
-		}
-	}
-	// Apply the preset's TCP signature_algorithms override (e.g. Chrome 150's
-	// ML-DSA codepoints) on top of the ClientHelloID base. The JA3 path carries its
-	// own sig-algs via JA3Extras, so it is skipped here.
-	if ja3String == "" && specToUse != nil {
+	// The preset's TCP signature_algorithms override (Chrome 150's ML-DSA
+	// codepoints, for instance) layers on top of a ClientHelloID base only. JA3
+	// carries its own via JA3Extras, and a captured raw hello already contains
+	// the client's real list, so overwriting it there would undo the capture.
+	if specSource == fingerprint.SourceClientHelloID {
 		fingerprint.ApplySignatureAlgorithms(specToUse.Extensions, t.preset.SignatureAlgorithms)
+		fingerprint.ApplyTrustAnchors(&specToUse.Extensions, t.preset.TrustAnchors)
 	}
 
 	// Fetch ECH config if needed. skipECH forces a no-ECH handshake, used by the
@@ -760,6 +799,17 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 
 	// Wrap with uTLS for fingerprinting
 	tlsConfig := &utls.Config{
+		// Go ramps its TLS record sizes (1186*N until 128KB) to trade latency for
+		// throughput. No browser does that, and the ramp is arithmetic, so a
+		// server reading the cleartext record lengths can identify the TLS stack
+		// lineage rather than merely noting "not a browser". Disable it so every
+		// record is full-size, as BoringSSL's are.
+		//
+		// This MUST ship with the DATA frame cap. On its own, measured, it makes
+		// the profile worse: the short trailing records go from four to nine over
+		// eight frames and land in a clean alternating pattern instead of hiding
+		// inside the ramp.
+		DynamicRecordSizingDisabled:        true,
 		ServerName:                         host,
 		InsecureSkipVerify:                 t.insecureSkipVerify,
 		MinVersion:                         minVersion,
@@ -798,6 +848,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 	}
 
 	// Perform TLS handshake
+	tlsStart := time.Now()
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		rawConn.Close()
 
@@ -846,6 +897,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 			// Keep the same TCP signature_algorithms override on the fallback spec.
 			if fallbackJA3 == "" && fallbackSpec != nil {
 				fingerprint.ApplySignatureAlgorithms(fallbackSpec.Extensions, t.preset.SignatureAlgorithms)
+				fingerprint.ApplyTrustAnchors(&fallbackSpec.Extensions, t.preset.TrustAnchors)
 			}
 
 			// Redo TLS handshake on the clean connection
@@ -872,8 +924,12 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 
 		return nil, fmt.Errorf("TLS handshake failed: %w", err)
 	}
-
 alpnCheck:
+	// Measured here rather than after the handshake call, because the
+	// speculative-TLS fallback re-dials and jumps straight to this label, and
+	// that path's handshake has to be counted too.
+	tlsElapsed = float64(time.Since(tlsStart).Microseconds()) / 1000
+
 	// Check ALPN negotiation result
 	state := tlsConn.ConnectionState()
 	if state.NegotiatedProtocol != "h2" {
@@ -888,137 +944,22 @@ alpnCheck:
 		}
 	}
 
-	// Build HTTP/2 settings from preset
-	settings := t.preset.HTTP2Settings
-
-	// Check TLSOnly mode - disables automatic compression and user-agent
+	// Check TLSOnly mode: no automatic Accept-Encoding, no default User-Agent.
 	tlsOnly := t.config != nil && t.config.TLSOnly
-	userAgent := t.preset.UserAgent
-	if tlsOnly {
-		userAgent = "" // Don't set default User-Agent in TLS-only mode
-	}
 
-	// Build SETTINGS map and order dynamically to include all non-zero settings
-	h2Settings := map[http2.SettingID]uint32{
-		http2.SettingHeaderTableSize:   settings.HeaderTableSize,
-		http2.SettingEnablePush:        boolToUint32(settings.EnablePush),
-		http2.SettingInitialWindowSize: settings.InitialWindowSize,
-		http2.SettingMaxHeaderListSize: settings.MaxHeaderListSize,
-	}
-	var h2SettingsOrder []http2.SettingID
-	if order := t.preset.H2SettingsOrder(); order != nil {
-		h2SettingsOrder = uint16sToSettingIDs(order)
-	} else {
-		// Build order dynamically to stay consistent with settings map.
-		// Base order depends on browser type, then conditional settings are appended.
-		if settings.NoRFC7540Priorities {
-			// Safari/iOS base order: 2, 4 (no HeaderTableSize or MaxHeaderListSize)
-			h2SettingsOrder = []http2.SettingID{
-				http2.SettingEnablePush,
-				http2.SettingInitialWindowSize,
-			}
-		} else {
-			// Chrome base order: 1, 2, 4, 6
-			h2SettingsOrder = []http2.SettingID{
-				http2.SettingHeaderTableSize,
-				http2.SettingEnablePush,
-				http2.SettingInitialWindowSize,
-				http2.SettingMaxHeaderListSize,
-			}
-		}
-		if settings.MaxConcurrentStreams > 0 {
-			h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxConcurrentStreams)
-		}
-		if settings.MaxFrameSize > 0 {
-			h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxFrameSize)
-		}
-		if settings.NoRFC7540Priorities {
-			h2SettingsOrder = append(h2SettingsOrder, http2.SettingNoRFC7540Priorities)
-		}
-	}
-	if settings.MaxConcurrentStreams > 0 {
-		h2Settings[http2.SettingMaxConcurrentStreams] = settings.MaxConcurrentStreams
-	}
-	if settings.MaxFrameSize > 0 {
-		h2Settings[http2.SettingMaxFrameSize] = settings.MaxFrameSize
-	}
-	if settings.NoRFC7540Priorities {
-		h2Settings[http2.SettingNoRFC7540Priorities] = 1
-	}
-
-	// Pseudo-header order: custom (Akamai) > preset H2Config > Safari/Chrome heuristic
-	pseudoOrder := []string{":method", ":authority", ":scheme", ":path"} // Chrome default
-	if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
-		pseudoOrder = t.config.CustomPseudoOrder
-	} else if order := t.preset.H2PseudoHeaderOrder(); order != nil {
-		pseudoOrder = order
-	} else if settings.NoRFC7540Priorities {
-		pseudoOrder = []string{":method", ":scheme", ":path", ":authority"} // Safari order
-	}
-
-	// Create HTTP/2 transport with native fingerprinting (no frame interception needed)
-	h2Transport := &http2.Transport{
-		AllowHTTP:                  false,
-		DisableCompression:         tlsOnly, // Disable auto Accept-Encoding in TLS-only mode
-		StrictMaxConcurrentStreams: false,
-		MaxHeaderListSize:          settings.MaxHeaderListSize,
-		MaxReadFrameSize:           settings.MaxFrameSize,
-		MaxDecoderHeaderTableSize:  settings.HeaderTableSize,
-		MaxEncoderHeaderTableSize:  settings.HeaderTableSize,
-		ReadIdleTimeout:            t.maxIdleTime,
-		PingTimeout:                15 * time.Second,
-
-		// Native fingerprinting via sardanioss/net
-		ConnectionFlow:     settings.ConnectionWindowUpdate,
-		Settings:           h2Settings,
-		SettingsOrder:      h2SettingsOrder,
-		DisableCookieSplit: t.preset.H2DisableCookieSplit(),
-		PseudoHeaderOrder: pseudoOrder,
-		HeaderPriority: func() *http2.PriorityParam {
-			// Chrome 120+ uses RFC 9218 extensible priorities (priority: header)
-			// instead of RFC 7540 PRIORITY frames. StreamWeight=0 means no PRIORITY data.
-			if settings.StreamWeight > 0 {
-				return &http2.PriorityParam{
-					Weight:    uint8(settings.StreamWeight - 1), // Wire format is weight-1
-					Exclusive: settings.StreamExclusive,
-					StreamDep: 0,
-				}
+	// One builder for both entrypoints. The transport path and the pool path
+	// used to construct this literal independently and had drifted; see
+	// internal/h2build.
+	h2Transport := h2build.Transport(h2build.Options{
+		Preset:  t.preset,
+		TLSOnly: tlsOnly,
+		PseudoHeaderOrder: func() []string {
+			if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
+				return t.config.CustomPseudoOrder
 			}
 			return nil
 		}(),
-		// Per-request priority table override. Chrome 147+ desktop emits a
-		// different stream weight per resource type (sec-fetch-dest), not a
-		// single session-wide value. When the preset defines a PriorityTable,
-		// we install a per-request callback that consults the request's
-		// Sec-Fetch-Dest header and returns the matching wire priority.
-		// The callback returns nil for unknown dest values, in which case the
-		// fork falls back to HeaderPriority above (legacy single-weight). For
-		// presets without a PriorityTable, HeaderPriorityFunc stays nil and
-		// behaviour is identical to the pre-#56 single-weight model.
-		HeaderPriorityFunc: func() func(req *http.Request) *http2.PriorityParam {
-			preset := t.preset
-			if !preset.H2HasPriorityTable() {
-				return nil
-			}
-			return func(req *http.Request) *http2.PriorityParam {
-				dest := req.Header.Get("Sec-Fetch-Dest")
-				weight, exclusive, _, ok := preset.H2PriorityFor(dest)
-				if !ok {
-					return nil // fall back to HeaderPriority static default
-				}
-				return &http2.PriorityParam{
-					Weight:    uint8(weight - 1), // wire format is weight-1; weight is 1..256, never 0
-					Exclusive: exclusive,
-					StreamDep: 0,
-				}
-			}
-		}(),
-		HeaderOrder:         t.preset.H2HeaderOrder(),
-		UserAgent:           userAgent,
-		StreamPriorityMode:  resolveStreamPriorityMode(t.preset.H2StreamPriorityMode()),
-		HPACKIndexingPolicy: resolveHPACKIndexingPolicy(t.preset.H2HPACKIndexingPolicy()),
-		HPACKNeverIndex:     t.preset.H2HPACKNeverIndex(),
-	}
+	})
 
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
@@ -1042,6 +983,9 @@ alpnCheck:
 		sessionResumed: sessionResumed,
 		tlsVersion:     connState.Version,
 		cipherSuite:    connState.CipherSuite,
+		dnsMs:          dnsMs,
+		tcpMs:          tcpElapsed,
+		tlsMs:          tlsElapsed,
 	}, nil
 }
 
@@ -1296,7 +1240,11 @@ func (c *persistentConn) close() {
 	}
 }
 
-// cleanupLoop periodically cleans up stale connections
+// cleanupLoop periodically cleans up stale connections. After CloseGraceful it
+// keeps running until the last retired connection has drained, because it is
+// the only thing that applies the abandoned-body bound to those connections;
+// stopping it at CloseGraceful would let a body that is never closed pin its
+// socket for the process lifetime.
 func (t *HTTP2Transport) cleanupLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1307,8 +1255,25 @@ func (t *HTTP2Transport) cleanupLoop() {
 			return
 		case <-ticker.C:
 			t.cleanup()
+			if t.drained() {
+				return
+			}
 		}
 	}
+}
+
+// drained reports whether a closed transport has nothing left to reclaim, i.e.
+// no connection is still deferring its close behind a streaming body.
+func (t *HTTP2Transport) drained() bool {
+	t.connsMu.RLock()
+	closed := t.closed
+	t.connsMu.RUnlock()
+	if !closed {
+		return false
+	}
+	t.retiredMu.Lock()
+	defer t.retiredMu.Unlock()
+	return len(t.retired) == 0
 }
 
 // cleanup removes stale connections
@@ -1330,32 +1295,63 @@ func (t *HTTP2Transport) cleanup() {
 	t.sweepRetired()
 }
 
-// Close shuts down the transport
+// Close shuts down the transport immediately. Every connection is closed,
+// including ones with a response body still streaming and ones left draining by
+// an earlier CloseGraceful.
 func (t *HTTP2Transport) Close() {
 	t.connsMu.Lock()
-	defer t.connsMu.Unlock()
-
-	if t.closed {
-		return
-	}
 	t.closed = true
+	conns := t.conns
+	t.conns = nil
+	t.connsMu.Unlock()
 
-	close(t.stopCleanup)
+	t.stopCleanupOnce.Do(func() { close(t.stopCleanup) })
 
-	for _, conn := range t.conns {
+	for _, conn := range conns {
 		go conn.close()
 	}
-	t.conns = nil
 
 	// Connections evicted while still streaming are not in t.conns. Shutdown is
 	// unconditional, so close them here too rather than leaving their sockets
 	// behind after the transport is gone.
 	t.retiredMu.Lock()
-	for _, conn := range t.retired {
-		go conn.close()
-	}
+	retired := t.retired
 	t.retired = nil
 	t.retiredMu.Unlock()
+	for _, conn := range retired {
+		go conn.close()
+	}
+}
+
+// CloseGraceful shuts down the transport without interrupting requests that are
+// in flight. It stops taking new requests, closes every idle connection now, and
+// retires each connection that still has a response body streaming on it so it
+// closes when that body finishes (or when the abandoned-body bound reclaims it,
+// should the caller never close the body). It returns immediately; the draining
+// connections are reclaimed in the background. Close may be called afterwards
+// to force whatever is still draining.
+func (t *HTTP2Transport) CloseGraceful() {
+	t.connsMu.Lock()
+	if t.closed {
+		t.connsMu.Unlock()
+		return
+	}
+	t.closed = true
+	conns := t.conns
+	t.conns = nil
+	t.connsMu.Unlock()
+
+	// retire, not requestClose: a connection whose close is deferred must stay
+	// tracked in t.retired so the cleanup loop can still bound it.
+	for _, conn := range conns {
+		t.retire(conn)
+	}
+
+	// Nothing left draining, so the cleanup loop has nothing to do; otherwise it
+	// runs on and exits itself once the last retired connection is gone.
+	if t.drained() {
+		t.stopCleanupOnce.Do(func() { close(t.stopCleanup) })
+	}
 }
 
 // Refresh closes all connections but keeps the TLS session cache intact.
@@ -1400,6 +1396,7 @@ func (t *HTTP2Transport) SetInsecureSkipVerify(skip bool) {
 // SetLocalAddr sets the local IP address for outgoing connections
 func (t *HTTP2Transport) SetLocalAddr(addr string) {
 	t.localAddr = addr
+	narrowDNSToLocalFamily(t.dnsCache, addr)
 }
 
 // Stats returns transport statistics
@@ -1441,6 +1438,30 @@ func (t *HTTP2Transport) IsConnectionReused(host, port string) bool {
 	}
 	// If connection exists and is usable, it will be reused
 	return t.isConnUsable(conn)
+}
+
+// ConnectionSetupTiming reports the measured DNS, TCP and TLS phases for the
+// pooled connection serving host:port, in milliseconds.
+//
+// It exists so the response path can report real numbers instead of the
+// fabricated breakdown it used to compute: DNSLookup, TCPConnect and
+// TLSHandshake were fixed fractions of FirstByte (0.2, 0.3 and 0.5 of 70% of
+// it), which are invented values in a public API field.
+//
+// ok is false when there is no such connection. A phase that was not separable
+// on the path taken, the proxy dial in particular, reports zero, which is the
+// value the Timing struct already documents for a phase that did not happen.
+func (t *HTTP2Transport) ConnectionSetupTiming(host, port string) (dnsMs, tcpMs, tlsMs float64, ok bool) {
+	key := net.JoinHostPort(host, port)
+	t.connsMu.RLock()
+	conn, exists := t.conns[key]
+	t.connsMu.RUnlock()
+	if !exists || conn == nil {
+		return 0, 0, 0, false
+	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.dnsMs, conn.tcpMs, conn.tlsMs, true
 }
 
 // GetConnectionUseCount returns how many times a connection has been used
@@ -1575,49 +1596,3 @@ func (t *HTTP2Transport) Connect(ctx context.Context, host, port string) error {
 
 	return nil
 }
-
-// boolToUint32 converts a bool to uint32 (for HTTP/2 SETTINGS)
-func boolToUint32(b bool) uint32 {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-// resolveStreamPriorityMode converts a string mode to the http2 constant.
-func resolveStreamPriorityMode(mode string) http2.StreamPriorityMode {
-	switch mode {
-	case "chrome":
-		return http2.StreamPriorityChrome
-	case "default":
-		return http2.StreamPriorityDefault
-	default:
-		return http2.StreamPriorityChrome
-	}
-}
-
-// resolveHPACKIndexingPolicy converts a string policy to the hpack constant.
-func resolveHPACKIndexingPolicy(policy string) hpack.IndexingPolicy {
-	switch policy {
-	case "chrome":
-		return hpack.IndexingChrome
-	case "never":
-		return hpack.IndexingNever
-	case "always":
-		return hpack.IndexingAlways
-	case "default":
-		return hpack.IndexingDefault
-	default:
-		return hpack.IndexingChrome
-	}
-}
-
-// uint16sToSettingIDs converts uint16 slice to http2.SettingID slice.
-func uint16sToSettingIDs(ids []uint16) []http2.SettingID {
-	result := make([]http2.SettingID, len(ids))
-	for i, id := range ids {
-		result[i] = http2.SettingID(id)
-	}
-	return result
-}
-

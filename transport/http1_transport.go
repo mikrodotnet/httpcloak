@@ -3,12 +3,12 @@ package transport
 import (
 	"bufio"
 	"context"
-	tls "github.com/sardanioss/utls"
 	"encoding/base64"
 	"fmt"
+	http "github.com/sardanioss/http"
+	tls "github.com/sardanioss/utls"
 	"io"
 	"net"
-	http "github.com/sardanioss/http"
 	"net/textproto"
 	"net/url"
 	"sort"
@@ -66,6 +66,13 @@ type http1Conn struct {
 	useCount   int64
 	mu         sync.Mutex
 	closed     bool
+	// Handshake outcome, captured once when the connection is established.
+	// H2 has carried these since it was written; H1 exposed nothing, so there
+	// was no way to tell a resumed handshake from a full one on this protocol,
+	// and no way to notice a preset that could never resume.
+	sessionResumed bool
+	tlsVersion     uint16
+	cipherSuite    uint16
 	// poisoned marks a connection interrupted mid-exchange by a cancelled
 	// request context. Atomic rather than guarded by mu: it is set from the
 	// context watchdog while doRequest holds mu for the whole exchange.
@@ -274,9 +281,13 @@ func (t *HTTP1Transport) SetInsecureSkipVerify(skip bool) {
 	t.insecureSkipVerify = skip
 }
 
-// SetLocalAddr sets the local IP address for outgoing connections
+// SetLocalAddr sets the local IP address for outgoing connections.
+//
+// It also keeps the shared DNS cache from staying restricted to a family this
+// transport is no longer bound to; see narrowDNSToLocalFamily.
 func (t *HTTP1Transport) SetLocalAddr(addr string) {
 	t.localAddr = addr
+	narrowDNSToLocalFamily(t.dnsCache, addr)
 }
 
 // RoundTrip implements http.RoundTripper
@@ -408,15 +419,19 @@ func (t *HTTP1Transport) RoundTripWithTLSConn(req *http.Request, tlsConn *utls.U
 	t.closedMu.RUnlock()
 
 	// Wrap the existing TLS connection into an http1Conn
+	handoffState := tlsConn.ConnectionState()
 	conn := &http1Conn{
-		host:       host,
-		port:       port,
-		conn:       tlsConn,
-		tlsConn:    tlsConn,
-		createdAt:  time.Now(),
-		lastUsedAt: time.Now(),
-		br:         bufio.NewReaderSize(tlsConn, 64*1024),  // 64KB read buffer
-		bw:         bufio.NewWriterSize(tlsConn, 256*1024), // 256KB write buffer
+		host:           host,
+		port:           port,
+		conn:           tlsConn,
+		tlsConn:        tlsConn,
+		createdAt:      time.Now(),
+		lastUsedAt:     time.Now(),
+		sessionResumed: handoffState.DidResume,
+		tlsVersion:     handoffState.Version,
+		cipherSuite:    handoffState.CipherSuite,
+		br:             bufio.NewReaderSize(tlsConn, 64*1024),  // 64KB read buffer
+		bw:             bufio.NewWriterSize(tlsConn, 256*1024), // 256KB write buffer
 	}
 
 	stopWatch := watchContext(req.Context(), conn)
@@ -709,85 +724,68 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 			keyLogWriter = GetKeyLogWriter()
 		}
 
-		// Determine the effective JA3 source: a programmatic CustomJA3 takes
-		// priority, then the preset's own JA3 (set by JSON custom presets). H2
-		// already does this; H1 used to look at config.CustomJA3 only, so a
-		// JSON-registered JA3 preset fell through to an empty ClientHelloID and
-		// failed with "tls: unknown ClientHelloID: -".
-		effJA3 := ""
-		var effJA3Extras *fingerprint.JA3Extras
-		if t.config != nil && t.config.CustomJA3 != "" {
-			effJA3 = t.config.CustomJA3
-			effJA3Extras = t.config.CustomJA3Extras
-		} else if t.preset.JA3 != "" {
-			effJA3 = t.preset.JA3
-			effJA3Extras = t.preset.JA3Extras
+		// One resolver for every TLS source, shared with the H2 transport, so a
+		// custom JA3, a preset JA3 and a captured raw hello are all decided in
+		// the same place rather than by two divergent inline chains.
+		customJA3, customJA3Extras := "", (*fingerprint.JA3Extras)(nil)
+		if t.config != nil {
+			customJA3, customJA3Extras = t.config.CustomJA3, t.config.CustomJA3Extras
 		}
+		wantPSK := fingerprint.HasPSKVariant(t.preset, customJA3)
+		specSource := fingerprint.ClientHelloSourceOf(t.preset, customJA3)
+		// Every source resolves a spec, the ClientHelloID one included. It
+		// used to hand the ID straight to UClient and edit uconn.Extensions
+		// afterwards; see applyH1Spec for why that could not work.
+		//
+		// The seed is 0 because it no longer decides anything here: a Chromium
+		// parrot reshuffles its literal with fresh randomness on every call,
+		// and a non-Chromium one does not permute at all.
+		resolvedSpec, _, specErr := fingerprint.ResolveClientHelloSpec(
+			t.preset, customJA3, customJA3Extras, wantPSK, 0)
+		if specErr != nil {
+			rawConn.Close()
+			return nil, NewTLSError("resolve_client_hello", host, port, "h1", specErr)
+		}
+		// Attaching a session cache to a spec with no pre_shared_key extension
+		// can break the handshake. This used to ask whether the JA3 string
+		// carried extension 41, which only worked for one of the three sources;
+		// inspecting the resolved spec answers it for all of them, and answers
+		// it about what actually goes on the wire.
+		useSessionCache := fingerprint.SpecHasPSKExtension(resolvedSpec)
 
 		tlsConfig := &utls.Config{
+			// Go ramps its TLS record sizes (1186*N until 128KB) to trade latency for
+			// throughput. No browser does that, and the ramp is arithmetic, so a
+			// server reading the cleartext record lengths can identify the TLS stack
+			// lineage rather than merely noting "not a browser". Disable it so every
+			// record is full-size, as BoringSSL's are.
+			//
+			// This MUST ship with the DATA frame cap. On its own, measured, it makes
+			// the profile worse: the short trailing records go from four to nine over
+			// eight frames and land in a clean alternating pattern instead of hiding
+			// inside the ramp.
+			DynamicRecordSizingDisabled:        true,
 			ServerName:                         host,
 			InsecureSkipVerify:                 t.insecureSkipVerify,
 			MinVersion:                         tls.VersionTLS12,
 			MaxVersion:                         tls.VersionTLS13,
 			NextProtos:                         []string{"http/1.1"}, // Force HTTP/1.1 only
+			OmitEmptyPsk:                       true,                 // Chrome sends no empty PSK on a first connection
 			PreferSkipResumptionOnNilExtension: true,                 // Skip resumption if spec has no PSK extension
 			KeyLogWriter:                       keyLogWriter,
 		}
 		t.tlsVerify.Apply(tlsConfig)
-		// Only set session cache when not using a JA3 without PSK extension
-		if effJA3 == "" || fingerprint.JA3HasExtension(effJA3, "41") {
+		if useSessionCache {
 			tlsConfig.ClientSessionCache = t.sessionCache
 		}
 
 		// Create TLS connection with appropriate fingerprint
-		var tlsConn *utls.UConn
-		if effJA3 != "" {
-			// JA3 (programmatic CustomJA3 or preset.JA3): parse to spec and apply with HelloCustom
-			spec, parseErr := fingerprint.ParseJA3(effJA3, effJA3Extras)
-			if parseErr != nil {
-				rawConn.Close()
-				return nil, NewTLSError("parse_ja3", host, port, "h1", parseErr)
-			}
-			// Force HTTP/1.1 ALPN in the spec
-			for _, ext := range spec.Extensions {
-				if alpn, ok := ext.(*utls.ALPNExtension); ok {
-					alpn.AlpnProtocols = []string{"http/1.1"}
-					break
-				}
-			}
-			tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
-			if err := tlsConn.ApplyPreset(spec); err != nil {
-				rawConn.Close()
-				return nil, NewTLSError("apply_ja3_preset", host, port, "h1", err)
-			}
-		} else {
-			// Use preset's ClientHelloID directly
-			// Note: ClientHelloID includes ALPN with [h2, http/1.1], so we must modify it
-			tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-			tlsConn.SetSessionCache(t.sessionCache)
-
-			// Build handshake state first - this populates Extensions from ClientHelloID
-			if err := tlsConn.BuildHandshakeState(); err != nil {
-				rawConn.Close()
-				return nil, NewTLSError("build_handshake", host, port, "h1", err)
-			}
-
-			// Force HTTP/1.1 only ALPN to prevent h2 negotiation
-			// Must be done AFTER BuildHandshakeState() which generates the extensions
-			for _, ext := range tlsConn.Extensions {
-				if alpn, ok := ext.(*utls.ALPNExtension); ok {
-					alpn.AlpnProtocols = []string{"http/1.1"}
-					break
-				}
-			}
-
-			// Apply the preset's TCP signature_algorithms override (e.g. Chrome 150
-			// ML-DSA) on the materialised extensions, same mechanism as the ALPN edit.
-			fingerprint.ApplySignatureAlgorithms(tlsConn.Extensions, t.preset.SignatureAlgorithms)
+		tlsConn, tlsErr := t.applyH1Spec(rawConn, tlsConfig, resolvedSpec, specSource)
+		if tlsErr != nil {
+			rawConn.Close()
+			return nil, NewTLSError("apply_"+specSource.String()+"_preset", host, port, "h1", tlsErr)
 		}
-		// Only set session cache for preset path or JA3 with PSK extension.
-		// Setting session cache on a spec without PSK extension can cause handshake failures.
-		if effJA3 == "" || fingerprint.JA3HasExtension(effJA3, "41") {
+		if useSessionCache {
 			tlsConn.SetSessionCache(t.sessionCache)
 		}
 
@@ -804,44 +802,21 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 					return nil, NewTLSError("speculative_fallback_dial", host, port, "h1", dialErr)
 				}
 
-				// Redo TLS setup on the clean connection
-				if effJA3 != "" {
-					spec, parseErr := fingerprint.ParseJA3(effJA3, effJA3Extras)
-					if parseErr != nil {
-						rawConn.Close()
-						return nil, NewTLSError("parse_ja3", host, port, "h1", parseErr)
-					}
-					for _, ext := range spec.Extensions {
-						if alpn, ok := ext.(*utls.ALPNExtension); ok {
-							alpn.AlpnProtocols = []string{"http/1.1"}
-							break
-						}
-					}
-					tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
-					if applyErr := tlsConn.ApplyPreset(spec); applyErr != nil {
-						rawConn.Close()
-						return nil, NewTLSError("apply_ja3_preset", host, port, "h1", applyErr)
-					}
-				} else {
-					tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-					if buildErr := tlsConn.BuildHandshakeState(); buildErr != nil {
-						rawConn.Close()
-						return nil, NewTLSError("build_handshake", host, port, "h1", buildErr)
-					}
-					for _, ext := range tlsConn.Extensions {
-						if alpn, ok := ext.(*utls.ALPNExtension); ok {
-							alpn.AlpnProtocols = []string{"http/1.1"}
-							break
-						}
-					}
+				// Redo TLS setup on the clean connection. The spec is resolved
+				// again rather than reused: ApplyPreset mutated the first one.
+				retrySpec, _, retryErr := fingerprint.ResolveClientHelloSpec(
+					t.preset, customJA3, customJA3Extras, wantPSK, 0)
+				if retryErr != nil {
+					rawConn.Close()
+					return nil, NewTLSError("resolve_client_hello", host, port, "h1", retryErr)
 				}
-				// Apply the preset's TCP signature_algorithms override on the
-				// speculative-fallback ClientHelloID path (JA3 carries its own).
-				if effJA3 == "" {
-					fingerprint.ApplySignatureAlgorithms(tlsConn.Extensions, t.preset.SignatureAlgorithms)
+				var applyErr error
+				tlsConn, applyErr = t.applyH1Spec(rawConn, tlsConfig, retrySpec, specSource)
+				if applyErr != nil {
+					rawConn.Close()
+					return nil, NewTLSError("apply_"+specSource.String()+"_preset", host, port, "h1", applyErr)
 				}
-				// Only set session cache when not using a JA3 without PSK extension
-				if effJA3 == "" || fingerprint.JA3HasExtension(effJA3, "41") {
+				if useSessionCache {
 					tlsConn.SetSessionCache(t.sessionCache)
 				}
 				if hsErr := tlsConn.HandshakeContext(ctx); hsErr != nil {
@@ -858,6 +833,14 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 
 		conn.tlsConn = tlsConn
 		conn.conn = tlsConn
+
+		// Record the handshake outcome once, here. Resumption is a property of
+		// the handshake, so reading it later off a pooled connection would be
+		// asking the wrong question.
+		cs := tlsConn.ConnectionState()
+		conn.sessionResumed = cs.DidResume
+		conn.tlsVersion = cs.Version
+		conn.cipherSuite = cs.CipherSuite
 
 		// Validate the negotiated protocol. H1 offers only http/1.1; an empty
 		// result (server did no ALPN) is fine, but if a non-conformant server
@@ -1134,11 +1117,15 @@ func (t *HTTP1Transport) doRequest(conn *http1Conn, req *http.Request) (*http.Re
 		return nil, err
 	}
 
-	// Read response
+	// Read response. The casing peek has to happen first: it reads nothing, but
+	// once ReadResponse has consumed the header block the original spelling is
+	// gone, since the parse underneath canonicalises the names.
+	casing := peekHeaderCasing(conn.br)
 	resp, err := http.ReadResponse(conn.br, req)
 	if err != nil {
 		return nil, err
 	}
+	stashHeaderCasing(resp.Header, casing)
 
 	return resp, nil
 }
@@ -1162,11 +1149,23 @@ func (t *HTTP1Transport) writeRequest(conn *http1Conn, req *http.Request) error 
 	// Connection header second, immediately after Host. Real Chrome emits
 	// "Connection: keep-alive" as the second request header on the HTTP/1.1 wire.
 	// Honor a caller-supplied value if present; otherwise default to keep-alive.
-	connValue := "keep-alive"
-	if v := req.Header.Get("Connection"); v != "" {
-		connValue = v
+	//
+	// Exact-headers mode is the exception. Its contract is that nothing the
+	// caller did not list goes on the wire, and a caller reproducing a captured
+	// request that carries no Connection cannot have one added back. Nothing
+	// breaks by leaving it out: HTTP/1.1 keeps connections alive by default, so
+	// the header is a restatement of the default rather than what enables it,
+	// which is why suppressing it here does not cost the connection pool
+	// anything. HTTP/1.0 would be a different matter, and this writer only
+	// speaks 1.1.
+	connValue := req.Header.Get("Connection")
+	exact := len(req.Header[exactHeadersKey]) > 0
+	if connValue == "" && !exact {
+		connValue = "keep-alive"
 	}
-	fmt.Fprintf(conn.bw, "Connection: %s\r\n", connValue)
+	if connValue != "" {
+		fmt.Fprintf(conn.bw, "Connection: %s\r\n", connValue)
+	}
 
 	// Determine if we need chunked encoding (unknown content length with body)
 	// http.NoBody is an explicit "no body" sentinel — don't use chunked for it
@@ -1260,6 +1259,76 @@ func h1WireHeaderName(canonicalKey string) string {
 	return canonicalKey
 }
 
+// resolveHeaderKey returns the key under which h actually stores the header
+// named by key.
+//
+// The ordered pass used to look up canonicalHeaderKey(key) directly, which is
+// correct for the preset path because applyPresetHeaders goes through
+// Header.Set and Go canonicalises there. It is wrong for ExactHeaders, which
+// stores the caller's key verbatim so their casing survives to the wire. A
+// lowercase "user-agent" therefore missed the ordered pass entirely and fell
+// into the sorted remainder below, so a caller who asked for
+// user-agent, accept, x-mirror got accept, user-agent, x-mirror: alphabetical,
+// which is exactly what a byte-exact mirror cannot have.
+//
+// Exact matches are tried first so the common path stays a single map lookup,
+// and the case-insensitive scan only runs for a name that is not stored
+// canonically.
+func resolveHeaderKey(h http.Header, key string) (string, bool) {
+	// The exact key wins over the canonical one. It used to be the other way
+	// round, which is invisible on the preset path (every key there is already
+	// canonical) but wrong for a caller who lists the same name twice in two
+	// casings: "Cookie" and "cookie" are two map entries, and preferring the
+	// canonical form pointed both order slots at the first one.
+	if _, ok := h[key]; ok {
+		return key, true
+	}
+	if canonical := canonicalHeaderKey(key); canonical != key {
+		if _, ok := h[canonical]; ok {
+			return canonical, true
+		}
+	}
+	// Last resort, a fold match. Map iteration is randomised, so with more than
+	// one candidate take the lowest rather than whichever the range hands over
+	// first: an order that changes per request is itself a fingerprint.
+	best := ""
+	found := false
+	for k := range h {
+		if strings.EqualFold(k, key) && (!found || k < best) {
+			best, found = k, true
+		}
+	}
+	if found {
+		return best, true
+	}
+	return canonicalHeaderKey(key), false
+}
+
+// valuesForSlot returns the values one order slot emits.
+//
+// n is how many slots the order list gives this header name and i is which of
+// them this is, counting from zero.
+//
+// One slot takes every value. That is the long-standing behaviour and the only
+// thing the preset path ever produces, since CompleteHeaderOrder deduplicates.
+// Several slots split the values one apiece in order, which is what lets exact
+// mode put an Accept between two Cookie headers instead of hoisting the second
+// Cookie up to join the first. The last slot takes whatever is left, so a
+// caller who lists a name twice but supplies three values does not lose the
+// third.
+func valuesForSlot(vals []string, n, i int) []string {
+	if n <= 1 {
+		return vals
+	}
+	if i >= len(vals) {
+		return nil
+	}
+	if i == n-1 {
+		return vals[i:]
+	}
+	return vals[i : i+1]
+}
+
 // writeHeadersInOrder writes headers in a browser-like order
 func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request, useChunked bool) {
 	// Check if custom header order is specified (from preset or user)
@@ -1302,6 +1371,18 @@ func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request,
 	}
 
 	written := make(map[string]bool)
+
+	// A name may hold more than one slot in the order list. Exact mode gives
+	// every pair its own slot, so "cookie, accept, cookie" has to put one
+	// cookie either side of the accept. Count the slots per resolved map key
+	// first, then hand slot i value i as the pass below walks the list.
+	slots := make(map[string]int, len(headerOrder))
+	for _, key := range headerOrder {
+		if mapKey, ok := resolveHeaderKey(req.Header, key); ok {
+			slots[mapKey]++
+		}
+	}
+	cursor := make(map[string]int, len(slots))
 
 	// Write headers in preferred order
 	for _, key := range headerOrder {
@@ -1352,12 +1433,22 @@ func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request,
 			continue
 		}
 
-		// Look up header using canonical key
-		if values, ok := req.Header[canonicalKey]; ok {
-			for _, v := range values {
-				fmt.Fprintf(w, "%s: %s\r\n", h1WireHeaderName(canonicalKey), v)
+		// Resolve the key the way the header map actually stores it, so
+		// ExactHeaders (which keeps the caller's casing) is found here rather
+		// than falling through to the sorted remainder.
+		if mapKey, ok := resolveHeaderKey(req.Header, key); ok {
+			// A key that is not in canonical form was supplied verbatim by the
+			// caller, so it goes on the wire verbatim. Anything canonical keeps
+			// the existing treatment, which lowercases the sec-ch-* cluster.
+			wire := h1WireHeaderName(mapKey)
+			if mapKey != canonicalHeaderKey(mapKey) {
+				wire = mapKey
 			}
-			written[canonicalKey] = true
+			for _, v := range valuesForSlot(req.Header[mapKey], slots[mapKey], cursor[mapKey]) {
+				fmt.Fprintf(w, "%s: %s\r\n", wire, v)
+			}
+			cursor[mapKey]++
+			written[mapKey] = true
 		}
 	}
 
@@ -1388,7 +1479,8 @@ func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request,
 		}
 		// Skip internal header ordering keys - these are used internally to control
 		// header order but MUST NOT be sent to the server
-		if key == http.HeaderOrderKey || key == http.PHeaderOrderKey {
+		if key == http.HeaderOrderKey || key == http.PHeaderOrderKey ||
+			key == h1HeaderCasingKey || key == exactHeadersKey {
 			continue
 		}
 		// Skip Transfer-Encoding and Content-Length if we're handling them specially
@@ -1639,6 +1731,8 @@ func (t *HTTP1Transport) Stats() map[string]HTTP1ConnStats {
 		var totalUseCount int64
 		var oldestCreated time.Time
 		var newestUsed time.Time
+		var resumed bool
+		var ver, suite uint16
 
 		for _, conn := range conns {
 			conn.mu.Lock()
@@ -1648,6 +1742,7 @@ func (t *HTTP1Transport) Stats() map[string]HTTP1ConnStats {
 			}
 			if conn.lastUsedAt.After(newestUsed) {
 				newestUsed = conn.lastUsedAt
+				resumed, ver, suite = conn.sessionResumed, conn.tlsVersion, conn.cipherSuite
 			}
 			conn.mu.Unlock()
 		}
@@ -1657,6 +1752,9 @@ func (t *HTTP1Transport) Stats() map[string]HTTP1ConnStats {
 			TotalUseCount:  totalUseCount,
 			OldestCreated:  oldestCreated,
 			NewestLastUsed: newestUsed,
+			SessionResumed: resumed,
+			TLSVersion:     ver,
+			CipherSuite:    suite,
 		}
 	}
 
@@ -1669,9 +1767,113 @@ type HTTP1ConnStats struct {
 	TotalUseCount  int64
 	OldestCreated  time.Time
 	NewestLastUsed time.Time
+
+	// Handshake state of the newest idle connection for this host. Resumption
+	// is a property of a handshake, not of a pool, so these describe one
+	// connection rather than aggregating.
+	SessionResumed bool
+	TLSVersion     uint16
+	CipherSuite    uint16
 }
 
 // GetDNSCache returns the DNS cache
 func (t *HTTP1Transport) GetDNSCache() *dns.Cache {
 	return t.dnsCache
+}
+
+// applyH1Spec builds the uTLS connection for a forced HTTP/1.1 handshake,
+// editing the spec BEFORE handing it to ApplyPreset.
+//
+// Every source goes through a resolved spec and HelloCustom, the ClientHelloID
+// one included. That branch used to pass the ID straight to UClient, call
+// BuildHandshakeState, and then edit uconn.Extensions. Edits made there only
+// reach the wire if something LATER forces a re-marshal of the hello: a spec
+// whose selected ClientHelloID carries a pre_shared_key extension re-marshals
+// to compute the binder and so picked them up, and one without silently did
+// not.
+//
+// That was not a fingerprint tell but a total handshake failure. The ALPN
+// rewrite was lost, the client advertised [h2, http/1.1] while its config said
+// [http/1.1], the server picked h2, and uTLS rejected its own peer's choice:
+//
+//	tls: server selected unadvertised ALPN protocol
+//
+// Measured against a live origin, forced HTTP/1.1 failed on every WebKit
+// preset, which is every Safari and iOS Chrome profile, and succeeded on
+// Chrome and Firefox. The two branches also carried the same four edits
+// twice, so the fix and the deduplication are the same change.
+//
+// Editing before ApplyPreset makes the ordering explicit: it marshals once,
+// after every override is in place, and regreases as it goes.
+func (t *HTTP1Transport) applyH1Spec(
+	rawConn net.Conn,
+	tlsConfig *utls.Config,
+	spec *utls.ClientHelloSpec,
+	source fingerprint.ClientHelloSource,
+) (*utls.UConn, error) {
+	// Force HTTP/1.1 so the server cannot negotiate h2 underneath us.
+	const only = "http/1.1"
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{only}
+			break
+		}
+	}
+
+	// And keep ALPS consistent with it. The rewrite above is ours, so the
+	// contradiction it creates is ours to clear: the hello was advertising
+	// application_settings for h2 while ALPN offered only http/1.1, which no
+	// browser produces. Chromium registers ALPS by walking the ALPN list,
+	// net/socket/ssl_client_socket_impl.cc:
+	//
+	//	for (NextProto proto : ssl_config_.alpn_protos) {
+	//	  auto iter = ssl_config_.application_settings.find(proto);
+	//	  if (iter != ssl_config_.application_settings.end()) {
+	//	    ... SSL_add_application_settings(...)
+	//
+	// so a socket offering only http/1.1 registers none, and BoringSSL then
+	// omits the extension. Applied to every source, because the ALPN rewrite
+	// that causes the mismatch is applied to every source too.
+	kept := spec.Extensions[:0]
+	for _, ext := range spec.Extensions {
+		var protos *[]string
+		switch alps := ext.(type) {
+		case *utls.ApplicationSettingsExtension:
+			protos = &alps.SupportedProtocols
+		case *utls.ApplicationSettingsExtensionNew:
+			protos = &alps.SupportedProtocols
+		}
+		if protos == nil {
+			kept = append(kept, ext)
+			continue
+		}
+		var offered []string
+		for _, p := range *protos {
+			if p == only {
+				offered = append(offered, p)
+			}
+		}
+		if len(offered) == 0 {
+			// Nothing left to negotiate settings for, so drop it entirely.
+			continue
+		}
+		*protos = offered
+		kept = append(kept, ext)
+	}
+	spec.Extensions = kept
+
+	// The preset's overrides layer on a ClientHelloID base only. JA3 carries
+	// its own signature algorithms through JA3Extras, and a captured raw hello
+	// already holds the client's real list, so applying them to either would
+	// undo the capture.
+	if source == fingerprint.SourceClientHelloID {
+		fingerprint.ApplySignatureAlgorithms(spec.Extensions, t.preset.SignatureAlgorithms)
+		fingerprint.ApplyTrustAnchors(&spec.Extensions, t.preset.TrustAnchors)
+	}
+
+	conn := utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
+	if err := conn.ApplyPreset(spec); err != nil {
+		return nil, err
+	}
+	return conn, nil
 }

@@ -318,6 +318,20 @@ class Response {
     this.protocol = data.protocol || "";
     this.elapsed = elapsed; // milliseconds
 
+    // headerOrder is the order the server sent its headers in, lowercase, one
+    // entry per occurrence; headerCasing is how it spelled them. An object
+    // carries neither, so relaying a response onward without these emits a
+    // different header block than the origin did. Order comes from HTTP/2 and
+    // HTTP/3, which decode an ordered field list; casing comes from HTTP/1.1,
+    // which is the only protocol where the names are not lowercase by
+    // definition. Each is empty on the protocols that cannot carry it.
+    this.headerOrder = data.header_order || [];
+    this.headerCasing = data.header_casing || [];
+
+    // The trailing header block sent after the body, lowercase keys. Empty
+    // when there was none. gRPC carries its status here.
+    this.trailer = data.trailer || {};
+
     // Parse cookies from response
     this._cookies = (data.cookies || []).map(c => new Cookie(c));
 
@@ -790,6 +804,14 @@ function getPlatformPackageName() {
   return `@httpcloak/${platName}-${archName}`;
 }
 
+// nativeLibName is the file the platform's build is published under.
+function nativeLibName(platform, arch) {
+  const archName = arch === "arm64" ? "arm64" : "amd64";
+  if (platform === "darwin") return `libhttpcloak-darwin-${archName}.dylib`;
+  if (platform === "win32") return `libhttpcloak-windows-${archName}.dll`;
+  return `libhttpcloak-linux-${archName}.so`;
+}
+
 /**
  * Get the path to the native library
  */
@@ -797,9 +819,21 @@ function getLibPath() {
   const platform = os.platform();
   const arch = os.arch();
 
+  // HTTPCLOAK_LIB_PATH points a single process at a specific build, which is
+  // what lets several processes sharing one install directory run different
+  // versions. It takes the library file or a directory holding it under the
+  // usual name; a directory used to be accepted and then handed to the loader
+  // as-is, which fails. A value that resolves to neither falls through to the
+  // normal search rather than being fatal, so a stale variable degrades.
   const envPath = process.env.HTTPCLOAK_LIB_PATH;
-  if (envPath && fs.existsSync(envPath)) {
-    return envPath;
+  if (envPath) {
+    if (fs.existsSync(envPath) && fs.statSync(envPath).isFile()) {
+      return envPath;
+    }
+    const inDir = path.join(envPath, nativeLibName(platform, arch));
+    if (fs.existsSync(inDir)) {
+      return inDir;
+    }
   }
 
   const packageName = getPlatformPackageName();
@@ -938,6 +972,8 @@ function getLib() {
       httpcloak_stream_get: nativeLibHandle.func("httpcloak_stream_get", "int64", ["int64", "str", "str"]),
       httpcloak_stream_post: nativeLibHandle.func("httpcloak_stream_post", "int64", ["int64", "str", "str", "str"]),
       httpcloak_stream_request: nativeLibHandle.func("httpcloak_stream_request", "int64", ["int64", "str"]),
+      httpcloak_stream_request_async: nativeLibHandle.func("httpcloak_stream_request_async", "void", ["int64", "str", "int64"]),
+      httpcloak_trim_memory: nativeLibHandle.func("httpcloak_trim_memory", "void", []),
       httpcloak_stream_get_metadata: nativeLibHandle.func("httpcloak_stream_get_metadata", HeapStr, ["int64"]),
       httpcloak_stream_read: nativeLibHandle.func("httpcloak_stream_read", HeapStr, ["int64", "int64"]),
       httpcloak_stream_close: nativeLibHandle.func("httpcloak_stream_close", "void", ["int64"]),
@@ -1264,6 +1300,41 @@ function addParamsToUrl(url, params) {
 /**
  * Apply basic auth to headers
  */
+/**
+ * Normalize the exactHeaders option into the [[name, value], ...] shape clib
+ * expects, or null when nothing was given.
+ *
+ * exactHeaders replaces the whole header pipeline: the pairs go out in the
+ * order and casing given, a name may repeat and each occurrence keeps its own
+ * position, and no preset headers, client hints or alphabetical tail are
+ * added. An object cannot express any of that, which is why this takes pairs.
+ * A Map or a plain object is accepted for convenience but cannot carry a
+ * repeated name, so the array form is the one to reach for.
+ *
+ * @param {Array<[string, string]>|Map<string, string>|Object|null} exactHeaders
+ * @returns {Array<[string, string]>|null}
+ */
+function normalizeExactHeaders(exactHeaders) {
+  if (exactHeaders === null || exactHeaders === undefined) return null;
+  let pairs;
+  if (Array.isArray(exactHeaders)) {
+    pairs = exactHeaders;
+  } else if (exactHeaders instanceof Map) {
+    pairs = Array.from(exactHeaders.entries());
+  } else if (typeof exactHeaders === "object") {
+    pairs = Object.entries(exactHeaders);
+  } else {
+    throw new TypeError("exactHeaders must be an array of [name, value] pairs, a Map, or an object");
+  }
+  if (pairs.length === 0) return null;
+  return pairs.map((pair) => {
+    if (!Array.isArray(pair) || pair.length < 2) {
+      throw new TypeError("each exactHeaders entry must be a [name, value] pair");
+    }
+    return [String(pair[0]), String(pair[1])];
+  });
+}
+
 function applyAuth(headers, auth) {
   if (!auth) {
     return headers;
@@ -1322,7 +1393,20 @@ function detectMimeType(filename) {
  * @returns {{ body: Buffer, contentType: string }}
  */
 function encodeMultipart(data, files) {
-  const boundary = `----HTTPCloakBoundary${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+  // Chrome's boundary, exactly: the literal prefix plus 16 characters drawn
+  // through a 6-bit mask over Blink's 64-entry table (A-Z, a-z, 0-9, then A and
+  // B again, which makes those two twice as likely). Source:
+  // third_party/blink/renderer/platform/network/form_data_encoder.cc,
+  // GenerateUniqueBoundaryString.
+  //
+  // This used to read "----HTTPCloakBoundary" plus a timestamp and Math.random,
+  // which named the product in a cleartext request header on every multipart
+  // upload, and varied in LENGTH because toString(16) trims trailing zeros.
+  const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB';
+  const rnd = require('crypto').randomBytes(16);
+  let suffix = '';
+  for (let i = 0; i < 16; i++) suffix += ALPHA[rnd[i] & 0x3f];
+  const boundary = `----WebKitFormBoundary${suffix}`;
   const parts = [];
 
   // Add form fields
@@ -1765,7 +1849,10 @@ class Session {
    * @returns {Response} Response object
    */
   getSync(url, options = {}) {
-    const { headers = null, params = null, cookies = null, auth = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false } = options;
+    // The get_raw entry has no exact_headers field, so a caller asking for one
+    // goes down the generic request path instead of having it dropped in silence.
+    if (options.exactHeaders) return this.requestSync("GET", url, options);
+    const { headers = null, params = null, cookies = null, auth = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -1784,6 +1871,9 @@ class Session {
     }
     if (allowRedirects !== null && allowRedirects !== undefined) {
       reqOptions.follow_redirects = !!allowRedirects;
+    }
+    if (disableRedirectReferer) {
+      reqOptions.disable_redirect_referer = true;
     }
     if (disableConditionalCache) {
       reqOptions.disable_conditional_cache = true;
@@ -1823,7 +1913,10 @@ class Session {
    * @returns {Response} Response object
    */
   postSync(url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false } = options;
+    // The post_raw entry has no exact_headers field, so a caller asking for one
+    // goes down the generic request path instead of having it dropped in silence.
+    if (options.exactHeaders) return this.requestSync("POST", url, options);
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -1871,6 +1964,9 @@ class Session {
     if (allowRedirects !== null && allowRedirects !== undefined) {
       reqOptions.follow_redirects = !!allowRedirects;
     }
+    if (disableRedirectReferer) {
+      reqOptions.disable_redirect_referer = true;
+    }
     if (disableConditionalCache) {
       reqOptions.disable_conditional_cache = true;
     }
@@ -1904,7 +2000,10 @@ class Session {
    * @returns {Response} Response object
    */
   requestSync(method, url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false } = options;
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false, exactHeaders = null, headerOrder = null } = options;
+
+    const exact = normalizeExactHeaders(exactHeaders);
+    const hOrder = Array.isArray(headerOrder) && headerOrder.length ? headerOrder.map(String) : null;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -1944,10 +2043,13 @@ class Session {
       method: method.toUpperCase(),
       url,
     };
+    if (exact) requestConfig.exact_headers = exact;
+    if (hOrder) requestConfig.header_order = hOrder;
     if (mergedHeaders) requestConfig.headers = mergedHeaders;
     if (timeout) requestConfig.timeout = timeout;
     if (fetchMode) requestConfig.fetch_mode = fetchMode;
     if (allowRedirects !== null && allowRedirects !== undefined) requestConfig.follow_redirects = !!allowRedirects;
+    if (disableRedirectReferer) requestConfig.disable_redirect_referer = true;
     if (disableConditionalCache) requestConfig.disable_conditional_cache = true;
     if (disableClientHints) requestConfig.disable_client_hints = true;
     if (disableHighEntropyClientHints) requestConfig.disable_high_entropy_client_hints = true;
@@ -1981,7 +2083,10 @@ class Session {
    * @returns {Promise<Response>} Response object
    */
   get(url, options = {}) {
-    const { headers = null, params = null, cookies = null, auth = null, fetchMode = null, timeout = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, signal = null } = options;
+    // The get_async entry has no exact_headers field, so a caller asking for one
+    // goes down the generic request path instead of having it dropped in silence.
+    if (options.exactHeaders) return this.request("GET", url, options);
+    const { headers = null, params = null, cookies = null, auth = null, fetchMode = null, timeout = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false, signal = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -2006,6 +2111,9 @@ class Session {
     }
     if (allowRedirects !== null && allowRedirects !== undefined) {
       reqOptions.follow_redirects = !!allowRedirects;
+    }
+    if (disableRedirectReferer) {
+      reqOptions.disable_redirect_referer = true;
     }
     if (disableConditionalCache) {
       reqOptions.disable_conditional_cache = true;
@@ -2036,7 +2144,10 @@ class Session {
    * @returns {Promise<Response>} Response object
    */
   post(url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, fetchMode = null, timeout = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, signal = null } = options;
+    // The post_async entry has no exact_headers field, so a caller asking for one
+    // goes down the generic request path instead of having it dropped in silence.
+    if (options.exactHeaders) return this.request("POST", url, options);
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, fetchMode = null, timeout = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false, signal = null } = options;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -2099,6 +2210,9 @@ class Session {
     if (allowRedirects !== null && allowRedirects !== undefined) {
       reqOptions.follow_redirects = !!allowRedirects;
     }
+    if (disableRedirectReferer) {
+      reqOptions.disable_redirect_referer = true;
+    }
     if (disableConditionalCache) {
       reqOptions.disable_conditional_cache = true;
     }
@@ -2132,7 +2246,10 @@ class Session {
    * @returns {Promise<Response>} Response object
    */
   request(method, url, options = {}) {
-    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, signal = null } = options;
+    let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false, exactHeaders = null, headerOrder = null, signal = null } = options;
+
+    const exact = normalizeExactHeaders(exactHeaders);
+    const hOrder = Array.isArray(headerOrder) && headerOrder.length ? headerOrder.map(String) : null;
 
     url = addParamsToUrl(url, params);
     let mergedHeaders = this._mergeHeaders(headers);
@@ -2183,12 +2300,15 @@ class Session {
       method: method.toUpperCase(),
       url,
     };
+    if (exact) requestConfig.exact_headers = exact;
+    if (hOrder) requestConfig.header_order = hOrder;
     if (mergedHeaders) requestConfig.headers = mergedHeaders;
     if (body) requestConfig.body = body;
     if (bodyEncoding) requestConfig.body_encoding = bodyEncoding;
     if (timeout) requestConfig.timeout = timeout;
     if (fetchMode) requestConfig.fetch_mode = fetchMode;
     if (allowRedirects !== null && allowRedirects !== undefined) requestConfig.follow_redirects = !!allowRedirects;
+    if (disableRedirectReferer) requestConfig.disable_redirect_referer = true;
     if (disableConditionalCache) requestConfig.disable_conditional_cache = true;
     if (disableClientHints) requestConfig.disable_client_hints = true;
     if (disableHighEntropyClientHints) requestConfig.disable_high_entropy_client_hints = true;
@@ -2793,7 +2913,7 @@ class Session {
    *   stream.close();
    */
   getStream(url, options = {}) {
-    const { params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false } = options;
+    const { params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false } = options;
 
     // Add params to URL
     if (params) {
@@ -2822,6 +2942,9 @@ class Session {
     }
     if (allowRedirects !== null && allowRedirects !== undefined) {
       reqOptions.follow_redirects = !!allowRedirects;
+    }
+    if (disableRedirectReferer) {
+      reqOptions.disable_redirect_referer = true;
     }
     if (disableConditionalCache) {
       reqOptions.disable_conditional_cache = true;
@@ -2871,7 +2994,7 @@ class Session {
    * @returns {StreamResponse} - Streaming response for chunked reading
    */
   postStream(url, options = {}) {
-    const { body: bodyOpt, json: jsonBody, form, params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false } = options;
+    const { body: bodyOpt, json: jsonBody, form, params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false } = options;
 
     // Add params to URL
     if (params) {
@@ -2913,6 +3036,9 @@ class Session {
     }
     if (allowRedirects !== null && allowRedirects !== undefined) {
       reqOptions.follow_redirects = !!allowRedirects;
+    }
+    if (disableRedirectReferer) {
+      reqOptions.disable_redirect_referer = true;
     }
     if (disableConditionalCache) {
       reqOptions.disable_conditional_cache = true;
@@ -2961,7 +3087,10 @@ class Session {
    * @returns {StreamResponse} - Streaming response for chunked reading
    */
   requestStream(method, url, options = {}) {
-    const { body, params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false } = options;
+    const { body, params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false, exactHeaders = null, headerOrder = null } = options;
+
+    const exact = normalizeExactHeaders(exactHeaders);
+    const hOrder = Array.isArray(headerOrder) && headerOrder.length ? headerOrder.map(String) : null;
 
     // Add params to URL
     if (params) {
@@ -2985,6 +3114,12 @@ class Session {
       method: method.toUpperCase(),
       url,
     };
+    if (exact) {
+      requestConfig.exact_headers = exact;
+    }
+    if (hOrder) {
+      requestConfig.header_order = hOrder;
+    }
     if (Object.keys(mergedHeaders).length > 0) {
       requestConfig.headers = mergedHeaders;
     }
@@ -2996,6 +3131,9 @@ class Session {
     }
     if (allowRedirects !== null && allowRedirects !== undefined) {
       requestConfig.follow_redirects = !!allowRedirects;
+    }
+    if (disableRedirectReferer) {
+      requestConfig.disable_redirect_referer = true;
     }
     if (disableConditionalCache) {
       requestConfig.disable_conditional_cache = true;
@@ -4411,7 +4549,36 @@ class PresetPool {
   }
 }
 
+
+/**
+ * Return freed memory to the operating system, blocking until it has.
+ *
+ * Closing a session makes its memory collectable, which is a different thing
+ * from giving it back. Go's allocator releases pages lazily and on Linux does
+ * so with MADV_FREE, so they stay counted against the process until the kernel
+ * wants them and RSS stays flat long after the sessions are gone. Measured over
+ * 150 sessions each doing a real TLS request: 85MB resident, and closing all of
+ * them then collecting moved it by under three megabytes, upward.
+ *
+ * This is a ceiling rather than a leak, bounded by how many sessions are alive
+ * at once, and a long-running process reuses those pages for the next batch.
+ * Reach for it when the ceiling itself is the problem: a worker that has
+ * finished a batch and will now idle, a memory-capped container, or a
+ * process-per-job model measuring RSS.
+ *
+ * Deliberately not part of Session.close(). It stops the world for a full
+ * collection, so closing sessions in a loop would pay that every time, which is
+ * worst for the callers closing the most. One call between batches costs the
+ * same collection and returns the same memory.
+ *
+ * Process-wide, not per session.
+ */
+function trimMemory() {
+  getLib().httpcloak_trim_memory();
+}
+
 module.exports = {
+  trimMemory,
   // Classes
   Session,
   LocalProxy,

@@ -5,6 +5,168 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-09-03
+
+Worth taking if you use HTTP/3 with a custom fingerprint. A preset built from a
+captured hello or a JA3 was not applying its fingerprint over HTTP/3 at all, and
+the requests succeeded anyway, so there was nothing to notice.
+
+### Fixed
+
+- **A preset using `raw_client_hello` or `ja3` lost its fingerprint on HTTP/3**: a preset carries one captured hello and one JA3, and which transport those describe is a property of the bytes, since every QUIC hello carries `quic_transport_parameters` and no TCP one does. Setting either cleared the preset's QUIC identity on the assumption that the capture was the whole fingerprint, which holds for TCP and is false for QUIC. The HTTP/3 transport then had nothing to build from and fell back to the QUIC stack's own default hello, so every request still succeeded while carrying a fingerprint nobody chose, and a worse one than the preset it inherited from. Measured against a live endpoint, `chrome-151-windows` over HTTP/3 went from 11 extensions to 7 purely from adding a TCP `ja3`. The QUIC identity now survives a TCP-only source, and whether a capture applies to QUIC is decided per transport rather than baked into the preset.
+
+- **HTTP/3 now resolves its hello from every fingerprint source, not just one**: the QUIC transport knew only the named QUIC client hello id, while HTTP/1.1 and HTTP/2 had moved to a shared resolver, so a captured QUIC hello could never be used. Both transports now go through the same resolution, each source gated on whether it describes that transport, so a QUIC capture is used on QUIC and a TCP capture is not. A source that cannot be used is an error rather than a silent fall-through, which is what let the original problem stay invisible.
+
+- **`allow_blunt_mimicry` no longer freezes the extension order**: the two were mutually exclusive, so declaring `permute_extensions` alongside it was ignored rather than refused. Everything whose position is genuinely constrained is modelled and stays pinned regardless: GREASE brackets the list, padding sizes the record, and `pre_shared_key` is required to be last. Only extensions that cannot be modelled at all are passed through opaquely, and those carry no ordering constraint. This mattered most on HTTP/3, where a capture could not be read without blunt mimicry, so every HTTP/3 mirror was frozen at a single extension order however the preset was written.
+
+### Changed
+
+- **A captured QUIC hello no longer needs `allow_blunt_mimicry`**: `quic_transport_parameters` was the one extension the TLS layer recognised without being able to parse, and blunt mimicry passes every unrecognised extension through unchecked, so that single gap switched off per-extension validation for the whole capture with no way to decline it. It is now parsed, and the captured bytes are kept exactly as they arrived rather than re-encoded, because the encoding allows several byte strings for the same meaning and for a fingerprint the bytes are the meaning. Nothing captured reaches the wire: transport parameters are specific to the connection that sent them, so the QUIC layer substitutes its own.
+
+## [1.7.1] - 2026-09-02
+
+### Added
+
+- **`TrimMemory` returns freed memory to the operating system**: closing a session makes its memory collectable, which is a different thing from handing it back. Go releases pages lazily and on Linux does so in a way that leaves them counted against the process until the kernel wants them, so resident memory stays flat long after the sessions are gone. Measured over 150 sessions each doing a real TLS request: 85MB resident, and closing every one of them then forcing a collection moved it by under three megabytes, in the wrong direction. `TrimMemory` runs the scavenge to completion and returned 61MB of it. This is a ceiling rather than a leak, bounded by how many sessions are alive at once, so reach for it when the ceiling itself is the problem: a worker that has finished a batch and will now idle, a memory-capped container, or a process-per-job model where resident size is what gets measured. It is deliberately not part of `Close`, because a full scavenge stops the world and a pool closing sessions steadily would pay that on every close. Available as `httpcloak.TrimMemory()`, `trim_memory()`, `trimMemory()` and `HttpCloakInfo.TrimMemory()`.
+
+- **Response trailers, header order and header casing**: the core recorded all three and none of them reached a binding. `trailer` carries the block sent after the body, which is where gRPC puts its status. `header_order` is the order the peer sent its headers in and `header_casing` is how it spelled them, which together let a proxy or bridge reproduce a response header block exactly, something a map cannot do. Order comes from HTTP/2 and HTTP/3, which decode an ordered field list; casing comes from HTTP/1.1, the only protocol where field names are not lowercase by definition. Streamed responses get `trailer()` as a method rather than a field, since on a stream the trailers have not arrived when the response opens.
+
+- **Per-request header order**: the core has accepted a per-request override for a while and no binding could reach it, so callers were left setting a session-wide order around a request, which races with everything else in flight. It stores nothing on the session, so concurrent requests can each carry their own, and it is a prefix rather than a replacement: names listed go first, in that order, and anything left out keeps the preset's own position.
+
+- **Streaming without blocking the event loop, in Python**: every streaming method blocked the calling thread until the response headers arrived, which in an asyncio program stalls every other coroutine for the length of a DNS lookup, a connect and a TLS handshake. `request_stream_async`, `get_stream_async` and `post_stream_async` await that instead. Against a server stalling before its headers, three concurrent opens now finish in the time of one. Only the opening is asynchronous; the body still reads synchronously.
+
+- **`exact_headers` in Node and .NET**: the C interface has carried it since 1.7.0 and only Python wrapped it, so a Node or .NET caller had no way to reproduce a captured request at all.
+
+- **`HTTPCLOAK_LIB_PATH` selects the shared library, in every binding**: a deployment running many processes out of one shared directory had no way to stage a rollout, since every binding searched relative to the installed package. Pointing a single process at a specific build gives back the per-process choice without splitting the fleet into separate folders. Python and Node already read the variable but mishandled a directory; .NET did not read it at all.
+
+- **`Session.CloseGraceful` closes a session without cutting off requests still in flight**: `Close` tears the session's connections down at once, which is right for shutdown but wrong for rotating a long-lived session, because any response body still being read on one of its connections is interrupted with "use of closed network connection". Anyone rotating sessions therefore had to guess a grace period longer than their longest possible request and sleep it out before calling `Close`. `CloseGraceful` stops the session taking new requests immediately (they fail with `ErrSessionClosed`, exactly as after `Close`), closes every idle connection now, and lets each connection that still has a response streaming on it finish that response first, closing it the moment the body is done. It returns without waiting; the draining happens in the background. This reuses the deferred close that 1.6.9 introduced for #83, applied to the whole HTTP/2 pool instead of to one evicted connection, and the pool's cleanup pass keeps running until the last such connection is gone so that a body which is never closed is still reclaimed by the abandoned-body bound rather than pinning its socket. HTTP/1.1 connections are only ever closed while idle, so they already behaved this way; HTTP/3 connections are closed immediately, as by `Close`, since the QUIC layer has no per-request drain. `Close` after `CloseGraceful` is not a no-op: it forces whatever is still draining. `Close` itself is unchanged.
+
+### Changed
+
+- **The .NET assembly is a drop-in over 1.6.8 and 1.7.0 again**: C# writes a call's full signature into the calling assembly, so adding an optional parameter to a shipped method leaves every already-compiled caller looking for a method that no longer exists, failing at the call rather than at load. Two releases did that, which left anyone unable to rebuild every consumer stuck on the version they had, even though nothing they used had changed behaviour. Every shape that went missing is back as a forwarding overload that does nothing but call the current method, so binaries compiled against either release run against this one unchanged. Nothing was removed and no behaviour moved. A public API baseline now runs on every push, so a future release cannot break this by accident.
+
+- **A session bound to a local address no longer resolves the family it cannot dial**: `WithLocalAddress` fixes the address family for every connection a session makes, because a socket bound to an IPv6 source cannot reach an IPv4 peer and vice versa. All three transports already knew this and dropped the unusable records after resolving them, each filtering the resolved set against the bound family before dialing and erroring with "no IPv6 addresses found for host" when nothing survives. The resolver was never told, so it was asked for both families on every lookup and half the answer was thrown away.
+
+  `getaddrinfo` turns an unrestricted lookup into an A query and an AAAA query, so that was two queries per lookup where one would do. Sessions are commonly built per connection when rotating source addresses, and each new session starts with a cold cache, so the waste scales with connection rate rather than with host count: at 200 new connections a second, one per five milliseconds, it is 200 queries a second for records that are discarded on arrival. Measured on Linux with the CGO resolver against a local `systemd-resolved`, sustaining the lookups alone with no connection attached, the discarded half cost roughly 270 microseconds of CPU each, about two thirds in the calling process and one third in the resolver. That is close to five percent of a core at 200 lookups a second, and around ten points of a core at both 500 and 1000.
+
+  `dns.Cache` now takes an address family via `SetNetwork("ip4" | "ip6" | "")`, and `NewTransportWithConfig` sets it from `LocalAddr` using the new `dns.NetworkForLocalAddr` helper. A restricted cache resolves through `net.Resolver.LookupIP` with that network instead of `LookupIPAddr`, which is what keeps the query off the wire rather than filtering the answer afterwards. Sessions with no local address are untouched and still query both families.
+
+  The restriction is only applied where one address is known to hold for the whole transport, which is at construction. The three protocol transports share a cache but keep their own local address, so a later `SetLocalAddr` on one of them reaches a cache its siblings are still filtering against: rebinding within the current family keeps the restriction, and anything else lifts it and resolves both families again, so no configuration reachable that way is worse off than before. Cached entries are stamped with the family they were resolved under and are not served while the cache is on another one, so a rebind cannot hand back a set the new family would filter down to nothing, and neither can a lookup that was already in flight when the family changed.
+
+  Nothing that previously connected stops connecting: the records no longer resolved are exactly the ones the dial paths were already refusing. The one visible difference is the error for a host that publishes no record of the bound family, which now comes back as a resolver error naming the host instead of a dial error reporting no usable address; it was a failure before this change too. `SetNetwork` ignores any value other than the three above, so a bad string cannot quietly turn every lookup into an error, and it does not re-resolve entries already in the cache, so change it before use or follow it with `Clear`.
+
+### Fixed
+
+- **A captured ClientHello that declares its client permutes now permutes on every handshake**: it was shuffled from a seed drawn once per transport, so every connection in a session repeated one order, and the HTTP/1.1 path passed a constant, which repeated one order for every process on every machine. Every other path already drew fresh randomness per connection, which is what the browsers that permute do. This affected presets built from a captured hello only; the named presets were always correct.
+
+- **Repeated header names keep their position in exact-headers mode**: the order list held one entry per name and every encoder read it as "emit all of this name's values here", so a captured request carrying two of one name either side of a third came out with them adjacent. Each pair now takes its own slot across HTTP/1.1, HTTP/2 and HTTP/3.
+
+- **The caller's header map is no longer merged over an exact-headers request**: the documented contract was that nothing unlisted reaches the wire, and the merge ran unconditionally at every request-building site. The session writes its cookie jar into that map, so a request built to mirror a capture went out with a jar cookie appended to it.
+
+- **An unknown preset name is an error instead of a silent downgrade**: a typo returned a two-year-old fingerprint and a 200, with nothing in the logs. It now fails with the closest matching name.
+
+- **`permute_extensions` works on the captured-hello path**: it was read from a field that path never consults, so declaring it did nothing.
+
+- **`disable_redirect_referer` is honoured everywhere it is accepted**: in .NET all 33 forwarding calls dropped it, so it worked only when the four generic methods were called directly, and setting it alone serialised no options at all. In Node two entry points accepted it and never wrote it into the request.
+
+- **A closed HTTP/2 connection is collectable immediately**: a never-reused connection was parked for five seconds after close so a fresh connection's error could still surface. That reasoning covers a connection that fails by itself, not one the caller closed, and it held the whole connection and its buffers for the duration. A thousand create-request-close cycles went from 99MB resident and 49MB of live heap to 25MB and 1.2MB, flat with cycle count.
+
+- **A transient failure on the first request to a host no longer pins that host to HTTP/1.1 for the rest of the session**: in auto mode the transport learns which protocol a host speaks and caches it per session, so later requests skip the negotiation (added for #68). Two different facts were being written into that cache under the same key. "This host negotiated http/1.1 via ALPN" is a property of the host and is right to cache. "The HTTP/2 attempt failed this time and the HTTP/1.1 fallback got the request through" is a property of one attempt: a reset or timed-out handshake, a first dial that did not survive, anything transient. That second case was cached exactly like the first, and only the very first request to a host (or the first after `Refresh`) could hit it, because once a host is known as HTTP/2 a later transient failure serves one request over HTTP/1.1 without touching the cache. So the failure mode was silent and permanent: one bad handshake on the opening request and every following request to that host went out over HTTP/1.1, and with it a different fingerprint, with nothing that would ever re-probe. Long-lived sessions and anything that creates sessions frequently (each new session starts with an empty cache) were the most exposed. The fallback still happens and the request still succeeds; it just no longer writes the cache, so the next request attempts HTTP/2 again and, when that works, the host is cached as HTTP/2 like any other. ALPN downgrades are cached as before, so an HTTP/1.1-only host still pays the failed HTTP/2 attempt only once. Forced protocols bypass the cache entirely and are unaffected, and so is what each request does on the wire: the fallback runs exactly as before, only the cache write is gone.
+
+## [1.7.0] - 2026-09-01
+
+### Added
+
+- **Chrome 152 preset family**: `chrome-152` plus the `chrome-152-windows` / `-linux` / `-macos` variants, `chrome-152-android`, and `chrome-152-ios`. All `chrome-latest*` aliases now resolve to 152. Unlike the last few version bumps this is a real wire change rather than a header refresh, in two places.
+
+  The first is a new TLS extension carrying the set of certificate authorities the client is willing to accept, sent as a list of short identifiers. Chrome 152 advertises 28 of them in a 184-byte list. The order is not stable: it comes from iterating a hash container whose seed is regenerated whenever the configuration is copied, which happens once per connection, so a browser sends the same set in a different sequence on every handshake. The preset reproduces that with a fresh permutation per connection rather than a fixed order, because a fixed order is the one thing a real client never produces.
+
+  The second is a placeholder value at the head of the signature algorithm list on TCP connections, drawn fresh per handshake. This one is worth knowing about because it makes the third component of the JA4 hash vary per connection against any implementation that does not discard placeholder values everywhere it meets them, which the JA4 specification asks for but not every implementation does. That is what a real Chrome 152 does, so the preset does it too. Connections over QUIC advertise nine signature algorithms with no placeholder and are unaffected.
+
+  `chrome-152-ios` carries neither, because it is built on the platform's own TLS stack rather than Chromium's and only its user agent moves.
+
+- **`raw_client_hello`: build a preset from a captured handshake**: a preset can now carry the bytes of a real ClientHello, base64-encoded, instead of describing one field by field. Everything the capture contains goes on the wire as captured, including extensions the library has no model for, which is what a field-by-field description cannot express. `raw_psk_client_hello` carries the resumption-shaped variant of the same client so that a session which resumes sends the hello that client actually sends when resuming, rather than a first-handshake shape with a session ticket bolted on. Captures are validated when the preset loads, so an unusable one is a named error at load time instead of a handshake failure on the first request. Unrecognised extensions need `tls.allow_blunt_mimicry`, and the error says so.
+
+- **`trust_anchors` and `quic_connection_options` as preset keys**: both are JSON-configurable, both round-trip through `describe_preset` byte-equal, and both are emitted only when a preset actually sets one, so describing a preset that does not use them no longer invents a value. `quic_connection_options` defaults to what current Chrome sends; making it a key rather than a constant means a change in that value is a preset edit rather than a release.
+
+- **Exact-headers mode**: `ExactHeaders` replaces the entire header pipeline for one request. The pairs go on the wire in the order and the casing given, a name may repeat at a chosen position, and nothing else is added: no preset block, no client hints, no `Sec-Fetch-*` inference, no alphabetical tail for names the preset does not know. It exists for reproducing a captured request verbatim, which the normal path cannot do because it is opinionated in exactly those three ways and because a `map[string][]string` cannot express two headers of the same name in a chosen position. Host and Connection on HTTP/1.1 and the pseudo-header block on HTTP/2 and HTTP/3 are still written for you, since those are protocol framing rather than caller headers.
+
+- **`DisableRedirectReferer`**: turns off the `Referer` that is otherwise synthesised on each redirect hop. The default stays on and follows the browser's own policy, the full previous URL same-origin, the origin alone cross-origin, nothing at all on an https-to-http downgrade, so leave it off unless you are reproducing a client that sends none. When set, no `Referer` reaches the next hop at all, including one set on the original request, because forwarding that would hand the pre-redirect URL to the new host.
+
+- **`Response.Trailer`**: the trailing header block a server sends after the body, lowercase-keyed, nil when there was none. It matters for gRPC, where the call's real status arrives in the trailers and the response is a 200 either way, so a client that ignores them reports every failed call as a success. Buffered responses carry it as a field, since the body is read before the response is built. Streamed ones expose `Trailer()` instead, because the trailing block has not arrived when the header block does and a field would hold the declared names with no values; call it after the body reaches EOF.
+
+- **`Response.HeaderCasing`**: the response header names as the server spelled them, HTTP/1.1 only. HTTP/2 and HTTP/3 require lowercase on the wire so there is nothing to preserve there, but on HTTP/1.1 the parse underneath canonicalises (`X-FOO` is reported as `X-Foo`), and anything relaying a response onward would emit a spelling the origin never used. Best-effort: nil when the header block was not fully buffered by the time the response was read, since correct casing is not worth blocking a response for.
+
+- **`LoadPresetFromJSONStrict` and `UnknownPresetFields`**: strict preset loading. The loader ignores keys it does not recognise, which is right for forward compatibility and wrong for a typo, and this is the quietest failure it has: a misspelled key does not fail, it leaves that part of the preset at whatever the inheritance chain supplied, so a file written to mirror one client can go on the wire as another with no error anywhere. `UnknownPresetFields` reports every unmodelled key as a dotted path; the strict loader refuses such a preset outright. The lenient loader stays the default. Free-form maps end the walk, so custom header names are not reported as typos.
+
+- **`permute_raw_hello`**: lets a preset built from a captured ClientHello shuffle its extension order per connection, the way Chromium does. It has to be declared rather than detected, because a capture is one connection and its extension order is one sample: nothing in the bytes says whether that client would have ordered them differently next time. Chromium permutes; NSS, Apple's stack and Go do not. Ignored when `allow_blunt_mimicry` is set, since extensions the library has no model for cannot be safely moved.
+
+- **`httpcloak_stream_request_async`**: an async streaming entry point in the C ABI, for Python, Node and .NET. The synchronous one blocks the calling thread until the response headers arrive, which for a stream can be the whole point of the request, so opening several long-lived streams cost a thread each and a single-threaded runtime could not open one without stalling. The callback carries the same metadata the synchronous path returns, with the stream handle added.
+
+- **HPACK representation control per header name**: a profile can pin how an individual header is encoded, which is what makes it possible to match a browser's compression instructions rather than only its header list.
+
+- **Response header order**: `Response.HeaderOrder` reports the order the server sent its headers in, one entry per occurrence, lowercased. A header map cannot carry order, so a caller relaying a response onward would otherwise emit a different sequence than the origin did. HTTP/2 and HTTP/3 record it for free; HTTP/1.1 reports nil, because the parser underneath canonicalises names and discards order.
+
+- **Resumption is observable**: whether a connection resumed a previous TLS session is now reported rather than inferred.
+
+- **Exact-headers mode added two headers the caller never listed.** Its contract is that nothing reaches the wire but what was given, and `Connection` went out on every HTTP/1.1 request while `accept-encoding` could go out twice on HTTP/2.
+
+  `Connection` is right on the normal path, since Chrome sends it on every HTTP/1.1 request, and wrong for a caller reproducing a capture that carries none. Nothing is lost by leaving it out: HTTP/1.1 keeps connections alive by default, so the header restates the default rather than causing it. A caller who lists it still gets exactly what they asked for.
+
+  The duplicate `accept-encoding` was the more interesting one. The gzip decision looked the header up under its canonical map key, but exact-headers stores names as the wire carries them, and HTTP/2 carries them lowercased, so a request already carrying `accept-encoding` was read as carrying none and had a second one appended. Two of the same header on the wire, which no browser sends.
+
+- **Every request went out with a top-level navigation's header order**, including the ones a browser never builds that way. Chrome constructs a navigation and a subresource through different paths and the leading block comes out differently: a navigation leads with the three low-entropy client hints, then `upgrade-insecure-requests`, then `user-agent`; a subresource leads with the platform hint and `user-agent`, then the other two hints, carries a `Referer`, and sends neither `upgrade-insecure-requests` nor `sec-fetch-user`. A preset carried one order and used it for everything, so anything that was not a page load, which for most callers is nearly every request, went out with an ordering the browser only produces for page loads.
+
+  What made it worth fixing is that the rest of the request was already right. The header set, the `Accept` value per destination, the `Sec-Fetch-*` values and the per-resource priority were all correct, so the ordering was the only part left saying the request had not been built the way a browser builds one, which is a worse signal than being uniformly wrong.
+
+  A profile can now carry a second order for non-navigation requests, chosen per request from the destination the request already computes. Measured across twenty requests covering script, style, image, font, manifest and a `fetch()`, all six produce a single order and only the navigation differs, so this is a two-way split rather than one order per resource type. Three headers appear conditionally and now have reserved slots rather than landing in the alphabetical tail: `origin` and the `pragma` / `cache-control` pair at the front, and `sec-fetch-storage-access` between `sec-fetch-dest` and `referer`. Presets that describe a client using one order for everything are unaffected, since the field is optional and absent means "use the one order for both".
+
+### Fixed
+
+- **Forced HTTP/1.1 contradicted itself on Safari and iOS presets**: the mode rewrites the offered protocol list down to HTTP/1.1 alone, but left the application-settings extension advertising HTTP/2. A client that says "I only speak HTTP/1.1" in one extension and "here are my HTTP/2 settings" in the next is describing a client that does not exist. The settings extension is now filtered to protocols the offer actually contains and dropped entirely when that leaves it empty. The two construction sites that had drifted apart are now one helper, which is why only one of them had the bug.
+
+- **`describe_preset` silently dropped the signature algorithm override**: a describe-then-load round trip of any preset carrying one lost every algorithm in it, so a preset rebuilt from its own description advertised a different list than the original. Nothing errored; the output simply had one fewer field than it needed.
+
+- **HTTP/2 flow control, frame sizing and record sizing did not match a browser**, in three ways that had to be fixed together because fixing any one alone leaves the profile more distinctive than it started.
+
+  Record sizes ramped. The TLS layer underneath grows its record size as it sends, trading latency for throughput, and record lengths sit in cleartext in the record header where anyone can read them without decrypting anything. One measured upload produced 3580, 4766, 5952, 2174, 9510, 6918, 11882, 4546, 14254, 2174. That is an arithmetic progression, and it does not merely say "not a browser", it names the TLS stack. The ramp is now off on every TCP path.
+
+  Frame sizes told the same story from the other end. A full 16384-byte DATA payload becomes a 16393-byte frame once its header is added, which the record layer then splits into one full record plus a 31-byte tail, so a large upload goes out as 16406, 31, 16406, 31 for its whole length. Chromium caps DATA payloads at 16375 precisely to avoid that, and ignores whatever maximum the peer advertised while doing it. The cap is derived per profile rather than applied globally, because Firefox and the WebKit family use the full 16384 and a blanket cap would hand one browser's framing to all the others.
+
+  Window updates were emitted on a cadence of our own rather than the browser's, which is visible in the timing and size of every update on a long-lived connection.
+
+- **The HTTP/2 retry replayed blindly**: a failed request was re-sent without asking why it failed, so a request the server had already begun processing could be sent twice. Retries are now classified, and only those the protocol says are safe to repeat are repeated.
+
+- **The HPACK encoder advertised one table size and used another**: the encoder was pinned to the size we advertise rather than the size the peer allows, so the compression state diverged from what the peer was tracking.
+
+- **HTTP/3 control-stream and transport-parameter values were more predictable than the real thing**: the greased setting on the control stream is now drawn the way the reference implementation draws it, deriving both its identifier and its value from independent draws rather than from a fixed pattern; the greased QUIC version label is built from four independent nibbles rather than a single choice; and the greased transport parameter is now genuinely random. A related assertion that the greased version had to come first has been removed, because it does not.
+
+- **The QUIC path stopped probing for the path MTU**, which is not something the browser does, and the QUIC configuration is now built in one place instead of three that had drifted.
+
+- **A resumed 0-RTT attempt repeated the attempt that had just failed**: when 0-RTT was rejected the retry went out identical to the request that had been refused.
+
+- **`SetDisableECH` was ignored on the HTTP/3 probe paths**: a session that had explicitly disabled encrypted client hello still sent it when the H3 probe ran, so the opt-out held everywhere except the one path most likely to run first.
+
+- **HTTP/1.1 never resumed a TLS session at all.** It is now able to, and a preset defined by a JA3 string can resume too. The old check asked whether the JA3 contained the pre-shared-key extension, which is only ever true for a string captured mid-resumption, so a first capture always reported no support.
+
+- **The multipart boundary named this library.** Every request with a multipart body carried the product name in a field no browser fills that way, in all four language bindings.
+
+- **`JA3Extras` had unreachable fields**, and unknown signature algorithms were dropped rather than passed through.
+
+- **Connection timing was partly derived rather than measured**, so the reported breakdown of a connection was arithmetic rather than observation.
+
+- **A connect race with both probes failed hung** instead of returning the failure.
+
+- **`ExactHeaders` went out alphabetically on HTTP/1.1**, and was silently discarded on a redirect hop. The first was a lookup that assumed the canonical spelling of every header name, which exact-headers mode deliberately does not use, so every name missed the ordered pass and fell into a sorted remainder. A caller asking for `user-agent, accept, x-mirror` got `accept, user-agent, x-mirror`. The second rebuilt the follow-up request from a fixed field list that did not include it, so a caller mirroring a captured request got their exact bytes on the first request and the full preset pipeline on every hop after it, with no error. For a feature whose entire purpose is byte-exact reproduction, both defeated the point.
+
+- **A preset that cannot serve a request is now rejected when it loads**, rather than failing on first use.
+
+- **The Python binding used two different names for the JSON body** and could crash on the fast path.
+
+- **The C ABI's int64 entry points returned a bare -1**, with no way to ask what went wrong. They now explain themselves.
+
+- **A prerelease published to npm took the `latest` tag.** npm has no notion of a prerelease version, so publishing one claimed the default install for every user while the other two registries correctly held theirs back. Prereleases now publish under their own tag.
+
 ## [1.6.11] - 2026-08-17
 
 ### Added

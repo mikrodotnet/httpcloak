@@ -211,9 +211,9 @@ func TestBuildPresetWithClientHello(t *testing.T) {
 	spec := &PresetSpec{
 		Name: "ch-test",
 		TLS: &TLSSpec{
-			ClientHello:     "chrome-146-windows",
-			PSKClientHello:  "chrome-146-windows-psk",
-			QUICClientHello: "chrome-146-quic",
+			ClientHello:        "chrome-146-windows",
+			PSKClientHello:     "chrome-146-windows-psk",
+			QUICClientHello:    "chrome-146-quic",
 			QUICPSKClientHello: "chrome-146-quic-psk",
 		},
 	}
@@ -541,8 +541,8 @@ func TestClonePresetDeepCopy(t *testing.T) {
 
 func TestClonePresetDeepCopyHeaders(t *testing.T) {
 	src := &Preset{
-		Name:      "src",
-		Headers:   map[string]string{"a": "1", "b": "2"},
+		Name:        "src",
+		Headers:     map[string]string{"a": "1", "b": "2"},
 		HeaderOrder: []HeaderPair{{Key: "x", Value: "y"}},
 	}
 	dst := clonePreset(src)
@@ -583,7 +583,19 @@ func TestClonePresetDeepCopyH2Config(t *testing.T) {
 
 // --- Mutual Exclusion Tests ---
 
-func TestApplyTLSJA3ClearsClientHelloID(t *testing.T) {
+// A JA3 replaces the TCP identity and leaves the QUIC one alone.
+//
+// This test used to assert the opposite, and the assertion was the bug. A JA3
+// or a captured hello describes the transport it came from, and a TCP one says
+// nothing about QUIC, so erasing the QUIC identity on the strength of it left
+// HTTP/3 with nothing to build from. The HTTP/3 transport then fell back to the
+// QUIC stack's own default hello, which is both wrong and quiet: measured
+// against a live endpoint, chrome-151-windows over HTTP/3 dropped from
+// q13d311_55b375c5d22e_653d80c3fe9d with 11 extensions to
+// q13d37_55b375c5d22e_4ca1098a2eeb with 7, purely from adding a TCP ja3 to the
+// preset. Whether a capture applies to QUIC is decided per transport, by
+// ResolveQUICClientHelloSpec, which is the only place that can know.
+func TestApplyTLSJA3ClearsTCPIdentityOnly(t *testing.T) {
 	// Start from a Chrome preset with ClientHelloID set, then overlay JA3
 	spec := &PresetSpec{
 		Name:    "ja3-override",
@@ -606,11 +618,15 @@ func TestApplyTLSJA3ClearsClientHelloID(t *testing.T) {
 	if p.PSKClientHelloID.Client != "" {
 		t.Fatal("expected PSKClientHelloID to be cleared")
 	}
-	if p.QUICClientHelloID.Client != "" {
-		t.Fatal("expected QUICClientHelloID to be cleared")
+	// And the QUIC identity survives, because a TCP JA3 is not evidence about
+	// QUIC. Losing it here is what silently downgraded every HTTP/3 request.
+	if p.QUICClientHelloID.Client == "" {
+		t.Error("QUICClientHelloID was cleared by a TCP JA3; HTTP/3 has nothing " +
+			"left to build from and falls back to a default hello")
 	}
-	if p.QUICPSKClientHelloID.Client != "" {
-		t.Fatal("expected QUICPSKClientHelloID to be cleared")
+	if p.QUICPSKClientHelloID.Client == "" {
+		t.Error("QUICPSKClientHelloID was cleared by a TCP JA3; HTTP/3 resumption " +
+			"loses its identity the same way")
 	}
 }
 
@@ -744,11 +760,11 @@ func TestBuildPresetCertCompFromTopLevelTLS(t *testing.T) {
 	spec := &PresetSpec{
 		Name: "top-level-extras",
 		TLS: &TLSSpec{
-			JA3:             "771,4865-4866-4867,0-23-65281-10-11,29-23-24,0",
+			JA3:                 "771,4865-4866-4867,0-23-65281-10-11,29-23-24,0",
 			SignatureAlgorithms: []uint16{1027, 2052},
-			ALPN:            []string{"h2", "http/1.1"},
-			CertCompression: []string{"brotli"},
-			RecordSizeLimit: ptrUint16(0x4001),
+			ALPN:                []string{"h2", "http/1.1"},
+			CertCompression:     []string{"brotli"},
+			RecordSizeLimit:     ptrUint16(0x4001),
 		},
 	}
 	p, err := BuildPreset(spec)
@@ -1321,25 +1337,25 @@ func TestPresetSpecJSONRoundTrip(t *testing.T) {
 
 func ptrUint64(v uint64) *uint64 { return &v }
 func ptrInt64(v int64) *int64    { return &v }
-func ptrBool(v bool) *bool { return &v }
+func ptrBool(v bool) *bool       { return &v }
 
 func TestClonePresetH3ConfigDeepCopy(t *testing.T) {
 	src := &Preset{
 		Name: "h3-clone-src",
 		H3Config: &H3FingerprintConfig{
-			QPACKMaxTableCapacity:    ptrUint64(32768),
-			QPACKBlockedStreams:      ptrUint64(50),
-			MaxFieldSectionSize:      ptrUint64(262144),
-			EnableDatagrams:          ptrBool(true),
-			QUICInitialPacketSize:    ptrUint16(1250),
+			QPACKMaxTableCapacity:     ptrUint64(32768),
+			QPACKBlockedStreams:       ptrUint64(50),
+			MaxFieldSectionSize:       ptrUint64(262144),
+			EnableDatagrams:           ptrBool(true),
+			QUICInitialPacketSize:     ptrUint16(1250),
 			QUICMaxIncomingStreams:    ptrInt64(100),
 			QUICMaxIncomingUniStreams: ptrInt64(103),
-			QUICAllow0RTT:            ptrBool(true),
-			QUICChromeStyleInitial:   ptrBool(true),
-			QUICDisableHelloScramble: ptrBool(false),
-			QUICTransportParamOrder:  "chrome",
-			MaxResponseHeaderBytes:   ptrUint64(262144),
-			SendGreaseFrames:         ptrBool(true),
+			QUICAllow0RTT:             ptrBool(true),
+			QUICChromeStyleInitial:    ptrBool(true),
+			QUICDisableHelloScramble:  ptrBool(false),
+			QUICTransportParamOrder:   "chrome",
+			MaxResponseHeaderBytes:    ptrUint64(262144),
+			SendGreaseFrames:          ptrBool(true),
 		},
 	}
 	dst := clonePreset(src)
@@ -1417,19 +1433,19 @@ func TestApplyHTTP3AllFields(t *testing.T) {
 	spec := &PresetSpec{
 		Name: "h3-all",
 		HTTP3: &HTTP3Spec{
-			QPACKMaxTableCapacity:    ptrUint64(32768),
-			QPACKBlockedStreams:      ptrUint64(50),
-			MaxFieldSectionSize:      ptrUint64(262144),
-			EnableDatagrams:          ptrBool(true),
-			QUICInitialPacketSize:    ptrUint16(1350),
+			QPACKMaxTableCapacity:     ptrUint64(32768),
+			QPACKBlockedStreams:       ptrUint64(50),
+			MaxFieldSectionSize:       ptrUint64(262144),
+			EnableDatagrams:           ptrBool(true),
+			QUICInitialPacketSize:     ptrUint16(1350),
 			QUICMaxIncomingStreams:    ptrInt64(200),
 			QUICMaxIncomingUniStreams: ptrInt64(103),
-			QUICAllow0RTT:            ptrBool(false),
-			QUICChromeStyleInitial:   ptrBool(false),
-			QUICDisableHelloScramble: ptrBool(true),
-			QUICTransportParamOrder:  &order,
-			MaxResponseHeaderBytes:   ptrUint64(131072),
-			SendGreaseFrames:         ptrBool(false),
+			QUICAllow0RTT:             ptrBool(false),
+			QUICChromeStyleInitial:    ptrBool(false),
+			QUICDisableHelloScramble:  ptrBool(true),
+			QUICTransportParamOrder:   &order,
+			MaxResponseHeaderBytes:    ptrUint64(131072),
+			SendGreaseFrames:          ptrBool(false),
 		},
 	}
 	p, err := BuildPreset(spec)
@@ -1830,12 +1846,12 @@ func TestApplyHTTP2IndividualFieldsFull(t *testing.T) {
 	spec := &PresetSpec{
 		Name: "h2-all-individual",
 		HTTP2: &HTTP2Spec{
-			MaxConcurrentStreams:  &maxConc,
-			MaxHeaderListSize:    &maxHL,
-			NoRFC7540Priorities:  &noRFC,
+			MaxConcurrentStreams:   &maxConc,
+			MaxHeaderListSize:      &maxHL,
+			NoRFC7540Priorities:    &noRFC,
 			ConnectionWindowUpdate: &connWU,
-			StreamWeight:         &sw,
-			StreamExclusive:      &se,
+			StreamWeight:           &sw,
+			StreamExclusive:        &se,
 		},
 	}
 	p, err := BuildPreset(spec)

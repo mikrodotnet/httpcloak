@@ -107,25 +107,6 @@ That's it. Full browser transport layer fingerprint.
 
 ---
 
-## vs curl_cffi
-
-```
-┌────────────────────────────────┬────────────────────────────────┐
-│        BOTH LIBRARIES          │       HTTPCLOAK ONLY           │
-├────────────────────────────────┼────────────────────────────────┤
-│                                │                                │
-│  + TLS fingerprint (JA3/JA4)   │  + HTTP/3 fingerprinting       │
-│  + HTTP/2 fingerprint          │  + ECH (encrypted SNI)         │
-│  + Post-quantum TLS            │  + MASQUE proxy                │
-│  + Bot score: 99               │  + Domain fronting             │
-│                                │  + Certificate pinning         │
-│                                │  + Go, Python, Node.js, C#     │
-│                                │                                │
-└────────────────────────────────┴────────────────────────────────┘
-```
-
----
-
 ## Install
 
 ```bash
@@ -1045,7 +1026,7 @@ response.Protocol
 
 | Browser | Versions | Platform suffixes | PQ | HTTP/3 |
 |---------|----------|-------------------|:--:|:------:|
-| Chrome | 143 to 151, `latest` | `-windows` `-linux` `-macos` `-android` `-ios` | yes | yes |
+| Chrome | 143 to 152, `latest` | `-windows` `-linux` `-macos` `-android` `-ios` | yes | yes |
 | Chrome | 133, 141 | none | yes | no |
 | Firefox | 148, `latest` | `-windows` `-linux` `-macos` | yes | no |
 | Firefox | 133 | `-windows` `-linux` `-macos` | no | no |

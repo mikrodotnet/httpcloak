@@ -20,6 +20,12 @@ Example:
 import asyncio
 import base64
 import json
+import warnings
+
+# The request methods take a parameter called json, which shadows the module
+# inside their bodies. _json is the same object under a name that does not
+# collide, so those methods can still serialise.
+_json = json
 import mimetypes
 import os
 import platform
@@ -29,7 +35,7 @@ import uuid
 from ctypes import CFUNCTYPE, POINTER, c_char_p, c_int, c_int64, c_void_p, cast, cdll
 from io import IOBase
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Union
+from typing import Any, BinaryIO, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlencode
 
 # File type for files parameter
@@ -54,7 +60,18 @@ def _encode_multipart(
     Returns:
         Tuple of (body_bytes, content_type_with_boundary)
     """
-    boundary = f"----HTTPCloakBoundary{uuid.uuid4().hex}"
+    # Chrome's boundary, exactly: the literal prefix plus 16 characters drawn
+    # through a 6-bit mask over Blink's 64-entry table (A-Z, a-z, 0-9, then A
+    # and B again, which makes those two twice as likely). Source:
+    # third_party/blink/renderer/platform/network/form_data_encoder.cc,
+    # GenerateUniqueBoundaryString.
+    #
+    # This used to read "----HTTPCloakBoundary" + a uuid, which named the
+    # product in a cleartext request header on every multipart upload.
+    _ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
+    boundary = "----WebKitFormBoundary" + "".join(
+        _ALPHA[b & 0x3F] for b in os.urandom(16)
+    )
     lines: List[bytes] = []
 
     # Add form fields
@@ -414,6 +431,9 @@ class Response:
         elapsed: float = 0.0,
         cookies: Optional[List[Cookie]] = None,
         history: Optional[List[RedirectInfo]] = None,
+        header_order: Optional[List[str]] = None,
+        header_casing: Optional[List[str]] = None,
+        trailer: Optional[Dict[str, List[str]]] = None,
     ):
         self.status_code = status_code
         self.headers = headers
@@ -424,6 +444,9 @@ class Response:
         self.elapsed = elapsed  # seconds as float
         self.cookies = cookies or []
         self.history = history or []
+        self.header_order = header_order or []
+        self.header_casing = header_casing or []
+        self.trailer = trailer or {}
 
         # Keep old names as aliases
         self.body = body
@@ -521,6 +544,9 @@ class Response:
             elapsed=elapsed,
             cookies=cookies,
             history=history,
+            header_order=data.get("header_order") or [],
+            header_casing=data.get("header_casing") or [],
+            trailer=data.get("trailer") or {},
         )
 
 
@@ -568,6 +594,9 @@ class FastResponse:
         elapsed: float = 0.0,
         cookies: Optional[List[Cookie]] = None,
         history: Optional[List[RedirectInfo]] = None,
+        header_order: Optional[List[str]] = None,
+        header_casing: Optional[List[str]] = None,
+        trailer: Optional[Dict[str, List[str]]] = None,
     ):
         self.status_code = status_code
         self.headers = headers
@@ -578,6 +607,9 @@ class FastResponse:
         self.elapsed = elapsed
         self.cookies = cookies or []
         self.history = history or []
+        self.header_order = header_order or []
+        self.header_casing = header_casing or []
+        self.trailer = trailer or {}
 
     @property
     def ok(self) -> bool:
@@ -712,6 +744,7 @@ class StreamResponse:
         protocol: str,
         content_length: int,
         cookies: Optional[List[Cookie]] = None,
+        header_order: Optional[List[str]] = None,
     ):
         self._handle = stream_handle
         self._lib = lib
@@ -722,7 +755,37 @@ class StreamResponse:
         self.protocol = protocol
         self.content_length = content_length
         self.cookies = cookies or []
+        self.header_order = header_order or []
         self._closed = False
+
+    def trailer(self) -> Dict[str, List[str]]:
+        """
+        Trailing header block, lowercase keys, or an empty dict when there was
+        none.
+
+        Call it once the body has been read to the end. Trailers arrive after
+        the body, so unlike the buffered Response this cannot be an attribute
+        set when the stream opens.
+
+        Before the body is finished it reports the names the response announced
+        in its Trailer header, each mapped to an empty list, because that is all
+        the peer has actually sent. So an empty list of values means "not here
+        yet", not "sent empty", and the way to tell them apart is to finish the
+        body first. gRPC is the case that needs this, since it carries its
+        status here.
+        """
+        if self._closed or self._handle is None:
+            return {}
+        ptr = self._lib.httpcloak_stream_trailer(c_int64(self._handle))
+        if not ptr:
+            return {}
+        try:
+            raw = cast(ptr, c_char_p).value
+            return json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, AttributeError):
+            return {}
+        finally:
+            self._lib.httpcloak_free_string(ptr)
 
     @property
     def ok(self) -> bool:
@@ -898,9 +961,21 @@ def _get_lib_path() -> str:
         Path(f"/usr/lib/{lib_name}"),
     ]
 
+    # HTTPCLOAK_LIB_PATH points a single process at a specific build, which is
+    # what lets several processes sharing one install directory run different
+    # versions. It takes the library file or a directory holding it under the
+    # usual name; a value that is neither falls through to the normal search
+    # rather than failing, so a stale variable degrades instead of breaking.
     env_path = os.environ.get("HTTPCLOAK_LIB_PATH")
     if env_path:
-        search_paths.insert(0, Path(env_path))
+        # A directory has to be joined with the file name rather than handed to
+        # the loader as-is. Testing for a file first is what keeps a directory
+        # from matching: Path.exists() is true for both.
+        p = Path(env_path)
+        if p.is_file():
+            search_paths.insert(0, p)
+        else:
+            search_paths.insert(0, p / lib_name)
 
     for path in search_paths:
         if path.exists():
@@ -989,8 +1064,42 @@ class _AsyncCallbackManager:
         elif response_json:
             try:
                 data = json.loads(response_json.decode("utf-8"))
-                response = Response._from_dict(data, elapsed=elapsed)
-                loop.call_soon_threadsafe(future.set_result, response)
+                # A non-zero stream_handle means this came from the streaming
+                # entry point, which has to hand the handle back through the
+                # callback because there is no return value to put it in. The
+                # synchronous path returns the handle directly and leaves this
+                # zero, so the field doubles as the discriminator between a
+                # buffered response and a stream that is only just open.
+                handle = data.get("stream_handle") or 0
+                if handle:
+                    result = StreamResponse(
+                        stream_handle=handle,
+                        lib=self._lib,
+                        status_code=data.get("status_code", 0),
+                        headers=data.get("headers") or {},
+                        final_url=data.get("final_url", ""),
+                        protocol=data.get("protocol", ""),
+                        content_length=data.get("content_length", -1),
+                        cookies=[
+                            Cookie(
+                                name=c.get("name", ""),
+                                value=c.get("value", ""),
+                                domain=c.get("domain", ""),
+                                path=c.get("path", ""),
+                                expires=c.get("expires", ""),
+                                max_age=c.get("max_age", 0),
+                                secure=c.get("secure", False),
+                                http_only=c.get("http_only", False),
+                                same_site=c.get("same_site", ""),
+                            )
+                            for c in (data.get("cookies") or [])
+                            if isinstance(c, dict)
+                        ],
+                        header_order=data.get("header_order") or [],
+                    )
+                else:
+                    result = Response._from_dict(data, elapsed=elapsed)
+                loop.call_soon_threadsafe(future.set_result, result)
             except Exception as e:
                 loop.call_soon_threadsafe(future.set_exception, HTTPCloakError(f"Failed to parse response: {e}"))
         else:
@@ -1019,8 +1128,16 @@ class _AsyncCallbackManager:
         # Register a NEW callback for this request (Go gives us a unique ID)
         callback_id = lib.httpcloak_register_callback(self._callback_ref)
 
-        # Create future and store it with start time
-        loop = asyncio.get_event_loop()
+        # Create future and store it with start time.
+        #
+        # get_running_loop, not get_event_loop: this loop is the one _on_callback
+        # later hands to call_soon_threadsafe from the cgo callback thread, so
+        # binding the wrong one means futures resolve on the wrong thread or
+        # never resolve at all. get_event_loop only happens to return the right
+        # object because every caller is a coroutine; outside a running loop it
+        # warns on 3.12 and raises on 3.14. This states the requirement instead
+        # of relying on it.
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         start_time = time.perf_counter()
         with self._lock:
@@ -1158,6 +1275,12 @@ def _setup_lib(lib):
     lib.httpcloak_stream_post.restype = c_int64
     lib.httpcloak_stream_request.argtypes = [c_int64, c_char_p]
     lib.httpcloak_stream_request.restype = c_int64
+    lib.httpcloak_stream_request_async.argtypes = [c_int64, c_char_p, c_int64]
+    lib.httpcloak_stream_request_async.restype = None
+    lib.httpcloak_stream_trailer.argtypes = [c_int64]
+    lib.httpcloak_stream_trailer.restype = c_void_p
+    lib.httpcloak_trim_memory.argtypes = []
+    lib.httpcloak_trim_memory.restype = None
     lib.httpcloak_stream_get_metadata.argtypes = [c_int64]
     lib.httpcloak_stream_get_metadata.restype = c_void_p
     lib.httpcloak_stream_read.argtypes = [c_int64, c_int64]
@@ -1214,6 +1337,8 @@ def _setup_lib(lib):
     lib.httpcloak_post_raw.restype = c_int64
     lib.httpcloak_request_raw.argtypes = [c_int64, c_char_p, c_char_p, c_int]
     lib.httpcloak_request_raw.restype = c_int64
+    lib.httpcloak_last_error.argtypes = [c_int64]
+    lib.httpcloak_last_error.restype = c_void_p
     lib.httpcloak_response_get_metadata.argtypes = [c_int64]
     lib.httpcloak_response_get_metadata.restype = c_void_p
     lib.httpcloak_response_get_body.argtypes = [c_int64, POINTER(c_int)]
@@ -1313,6 +1438,57 @@ def _parse_response(result_ptr, elapsed: float = 0.0) -> Response:
     if "error" in data:
         raise HTTPCloakError(data["error"])
     return Response._from_dict(data, elapsed=elapsed)
+
+
+
+
+def _resolve_json_alias(json_value, json_data_value):
+    """
+    Reconcile the two spellings of the JSON body parameter.
+
+    The sync non-fast methods took ``json``; the async, fast and streaming
+    methods took ``json_data``, so the same argument had a different name
+    depending on which method you reached for. ``json`` is the primary name
+    now and matches what requests-shaped code expects. ``json_data`` still
+    works and is deprecated.
+
+    Passing both is a mistake rather than something to merge, so it raises
+    instead of silently picking one.
+    """
+    if json_value is not None and json_data_value is not None:
+        raise TypeError(
+            "pass json= or json_data=, not both. json_data is a deprecated "
+            "alias for json"
+        )
+    if json_data_value is not None:
+        warnings.warn(
+            "json_data is deprecated, use json instead",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return json_data_value
+    return json_value
+
+
+def _last_error(lib, handle, fallback="Request failed"):
+    """
+    Read why the most recent int64-returning call on ``handle`` failed.
+
+    ``httpcloak_request_raw`` returns a response handle and signals failure
+    with -1, so the return type cannot carry a message. Without this, an
+    invalid request JSON, an undecodable body and a real network failure all
+    reached the caller as the same ``Request failed`` string.
+    """
+    ptr = lib.httpcloak_last_error(handle)
+    if not ptr:
+        return fallback
+    try:
+        raw = cast(ptr, c_char_p).value
+        if not raw:
+            return fallback
+        return raw.decode("utf-8", "replace")
+    finally:
+        lib.httpcloak_free_string(ptr)
 
 
 def _parse_raw_response(lib, response_handle: int, elapsed: float = 0.0) -> Response:
@@ -1439,6 +1615,9 @@ def _parse_fast_response(lib, response_handle: int, elapsed: float = 0.0) -> Fas
             elapsed=elapsed,
             cookies=cookies,
             history=history,
+            header_order=data.get("header_order") or [],
+            header_casing=data.get("header_casing") or [],
+            trailer=data.get("trailer") or {},
         )
 
     finally:
@@ -1969,6 +2148,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Response:
         """
         Perform a POST request.
@@ -2048,7 +2228,7 @@ class Session:
         merged_headers = self._apply_cookies(merged_headers, cookies)
 
         if timeout:
-            return self.request("POST", url, headers=merged_headers, data=body, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+            return self.request("POST", url, headers=merged_headers, data=body, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
         # Build options JSON with headers wrapper (clib expects {"headers": {...}})
         options = {}
@@ -2064,6 +2244,8 @@ class Session:
             options["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             options["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            options["disable_redirect_referer"] = True
         options_json = json_module.dumps(options).encode("utf-8") if options else None
 
         body_len = len(body) if body else 0
@@ -2079,7 +2261,7 @@ class Session:
         elapsed = time.perf_counter() - start_time
 
         if response_handle < 0:
-            raise HTTPCloakError("Request failed")
+            raise HTTPCloakError(_last_error(self._lib, self._handle))
 
         return _parse_raw_response(self._lib, response_handle, elapsed=elapsed)
 
@@ -2091,6 +2273,8 @@ class Session:
         data: Union[str, bytes, Dict, None] = None,
         json: Optional[Dict] = None,
         files: Optional[FilesType] = None,
+        exact_headers: Optional[Sequence[Tuple[str, str]]] = None,
+        header_order: Optional[Sequence[str]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
@@ -2100,6 +2284,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Response:
         """
         Perform a custom HTTP request.
@@ -2119,6 +2304,11 @@ class Session:
                 options). The clib expects milliseconds; the conversion is
                 applied below.
         """
+        # exact_headers replaces the whole header pipeline: the pairs go out in
+        # the order and casing given, a name may repeat, and no preset headers,
+        # client hints or alphabetical tail are added. A dict cannot express any
+        # of that, which is why this takes a sequence of pairs.
+        _exact = [[str(k), str(v)] for k, v in exact_headers] if exact_headers else None
         import json as json_module
 
         url = _add_params_to_url(url, params)
@@ -2156,6 +2346,14 @@ class Session:
             "method": method.upper(),
             "url": url,
         }
+        if _exact:
+            request_config["exact_headers"] = _exact
+        # A per-request order overrides whatever set_header_order installed and
+        # stores nothing on the session, so concurrent requests can each carry
+        # their own. It is a prefix: names listed here go first, in this order,
+        # and anything left out keeps the preset's own position.
+        if header_order:
+            request_config["header_order"] = [str(h) for h in header_order]
         if merged_headers:
             request_config["headers"] = merged_headers
         if timeout:
@@ -2171,6 +2369,8 @@ class Session:
             request_config["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             request_config["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            request_config["disable_redirect_referer"] = True
 
         body_len = len(body_bytes) if body_bytes else 0
 
@@ -2184,7 +2384,7 @@ class Session:
         elapsed = time.perf_counter() - start_time
 
         if response_handle < 0:
-            raise HTTPCloakError("Request failed")
+            raise HTTPCloakError(_last_error(self._lib, self._handle))
 
         return _parse_raw_response(self._lib, response_handle, elapsed=elapsed)
 
@@ -2204,9 +2404,10 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Response:
         """Perform a PUT request."""
-        return self.request("PUT", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+        return self.request("PUT", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
     def delete(
         self,
@@ -2221,9 +2422,10 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Response:
         """Perform a DELETE request."""
-        return self.request("DELETE", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+        return self.request("DELETE", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
     def patch(
         self,
@@ -2241,9 +2443,10 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Response:
         """Perform a PATCH request."""
-        return self.request("PATCH", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+        return self.request("PATCH", url, params=params, data=data, json=json, files=files, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
     def head(
         self,
@@ -2258,9 +2461,10 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Response:
         """Perform a HEAD request."""
-        return self.request("HEAD", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+        return self.request("HEAD", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
     def options(
         self,
@@ -2275,9 +2479,10 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Response:
         """Perform an OPTIONS request."""
-        return self.request("OPTIONS", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+        return self.request("OPTIONS", url, params=params, headers=headers, cookies=cookies, auth=auth, timeout=timeout, fetch_mode=fetch_mode, allow_redirects=allow_redirects, disable_conditional_cache=disable_conditional_cache, disable_client_hints=disable_client_hints, disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
     # =========================================================================
     # Async Methods (Native - using Go goroutines)
@@ -2295,6 +2500,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
         timeout: Optional[int] = None,
     ) -> Response:
         """
@@ -2334,6 +2540,8 @@ class Session:
             options["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             options["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            options["disable_redirect_referer"] = True
         if timeout is not None:
             # The async clib exports read timeout in SECONDS (unlike the sync
             # *_raw exports, which use milliseconds).
@@ -2354,6 +2562,7 @@ class Session:
         self,
         url: str,
         data: Union[str, bytes, Dict, None] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         files: Optional[FilesType] = None,
         params: Optional[Dict[str, Any]] = None,
@@ -2365,6 +2574,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
         timeout: Optional[int] = None,
     ) -> Response:
         """
@@ -2380,6 +2590,7 @@ class Session:
             cookies: Cookies to send with this request
             auth: Basic auth tuple (username, password)
         """
+        json_data = _resolve_json_alias(json, json_data)
         url = _add_params_to_url(url, params)
         merged_headers = self._merge_headers(headers)
 
@@ -2390,7 +2601,7 @@ class Session:
             merged_headers = merged_headers or {}
             merged_headers["Content-Type"] = content_type
         elif json_data is not None:
-            body = json.dumps(json_data).encode("utf-8")
+            body = _json.dumps(json_data).encode("utf-8")
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
         elif data is not None:
@@ -2435,13 +2646,15 @@ class Session:
             options["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             options["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            options["disable_redirect_referer"] = True
         if body_encoding:
             options["body_encoding"] = body_encoding
         if timeout is not None:
             # The async clib exports read timeout in SECONDS (the sync *_raw
             # exports use milliseconds).
             options["timeout"] = timeout
-        options_json = json.dumps(options).encode("utf-8") if options else None
+        options_json = _json.dumps(options).encode("utf-8") if options else None
 
         # Start async request
         self._lib.httpcloak_post_async(
@@ -2459,6 +2672,7 @@ class Session:
         method: str,
         url: str,
         data: Union[str, bytes, Dict, None] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         files: Optional[FilesType] = None,
         params: Optional[Dict[str, Any]] = None,
@@ -2470,6 +2684,9 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
+        exact_headers: Optional[Sequence[Tuple[str, str]]] = None,
+        header_order: Optional[Sequence[str]] = None,
         timeout: Optional[int] = None,
     ) -> Response:
         """
@@ -2486,6 +2703,12 @@ class Session:
             cookies: Cookies to send with this request
             auth: Basic auth tuple (username, password)
         """
+        # exact_headers replaces the whole header pipeline: the pairs go out in
+        # the order and casing given, a name may repeat, and no preset headers,
+        # client hints or alphabetical tail are added. A dict cannot express any
+        # of that, which is why this takes a sequence of pairs.
+        _exact = [[str(k), str(v)] for k, v in exact_headers] if exact_headers else None
+        json_data = _resolve_json_alias(json, json_data)
         url = _add_params_to_url(url, params)
         merged_headers = self._merge_headers(headers)
 
@@ -2499,7 +2722,7 @@ class Session:
             merged_headers = merged_headers or {}
             merged_headers["Content-Type"] = content_type
         elif json_data is not None:
-            body = json.dumps(json_data)
+            body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
         elif data is not None:
@@ -2522,6 +2745,14 @@ class Session:
             "method": method.upper(),
             "url": url,
         }
+        if _exact:
+            request_config["exact_headers"] = _exact
+        # A per-request order overrides whatever set_header_order installed and
+        # stores nothing on the session, so concurrent requests can each carry
+        # their own. It is a prefix: names listed here go first, in this order,
+        # and anything left out keeps the preset's own position.
+        if header_order:
+            request_config["header_order"] = [str(h) for h in header_order]
         if merged_headers:
             request_config["headers"] = merged_headers
         if body:
@@ -2538,6 +2769,8 @@ class Session:
             request_config["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             request_config["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            request_config["disable_redirect_referer"] = True
         if timeout is not None:
             # httpcloak_request_async reads RequestConfig.timeout in SECONDS.
             request_config["timeout"] = timeout
@@ -2549,7 +2782,7 @@ class Session:
         # Start async request
         self._lib.httpcloak_request_async(
             self._handle,
-            json.dumps(request_config).encode("utf-8"),
+            _json.dumps(request_config).encode("utf-8"),
             callback_id,
         )
 
@@ -3139,6 +3372,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> Union[Response, StreamResponse]:
         """
         Perform a GET request.
@@ -3173,7 +3407,7 @@ class Session:
                                     allow_redirects=allow_redirects,
                                     disable_conditional_cache=disable_conditional_cache,
                                     disable_client_hints=disable_client_hints,
-                                    disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+                                    disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
         # Regular request (existing implementation)
         url = _add_params_to_url(url, params)
@@ -3187,7 +3421,7 @@ class Session:
                                 allow_redirects=allow_redirects,
                                 disable_conditional_cache=disable_conditional_cache,
                                 disable_client_hints=disable_client_hints,
-                                disable_high_entropy_client_hints=disable_high_entropy_client_hints)
+                                disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer)
 
         # Build options JSON with headers wrapper (clib expects {"headers": {...}})
         options = {}
@@ -3203,6 +3437,8 @@ class Session:
             options["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             options["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            options["disable_redirect_referer"] = True
         options_json = json.dumps(options).encode("utf-8") if options else None
 
         start_time = time.perf_counter()
@@ -3215,7 +3451,7 @@ class Session:
         elapsed = time.perf_counter() - start_time
 
         if response_handle < 0:
-            raise HTTPCloakError("Request failed")
+            raise HTTPCloakError(_last_error(self._lib, self._handle))
 
         return _parse_raw_response(self._lib, response_handle, elapsed=elapsed)
 
@@ -3276,7 +3512,7 @@ class Session:
         elapsed = time.perf_counter() - start_time
 
         if response_handle < 0:
-            raise HTTPCloakError("Request failed")
+            raise HTTPCloakError(_last_error(self._lib, self._handle))
 
         return _parse_fast_response(self._lib, response_handle, elapsed=elapsed)
 
@@ -3284,6 +3520,7 @@ class Session:
         self,
         url: str,
         data: Optional[Union[str, bytes, Dict[str, Any]]] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
@@ -3317,6 +3554,7 @@ class Session:
             requests. If you need to keep the data, copy it with bytes(r.content).
         """
         # Use request auth if provided, otherwise fall back to session auth
+        json_data = _resolve_json_alias(json, json_data)
         effective_auth = auth if auth is not None else self.auth
 
         merged_headers = self._merge_headers(headers)
@@ -3327,8 +3565,13 @@ class Session:
         body_bytes = None
         body_len = 0
         if json_data is not None:
-            body_bytes = json.dumps(json_data).encode("utf-8")
+            body_bytes = _json.dumps(json_data).encode("utf-8")
             body_len = len(body_bytes)
+            # _apply_cookies returns None when there are neither headers nor
+            # cookies, so this assignment used to raise TypeError and a JSON
+            # body with no headers could not be sent at all. The sync methods
+            # already guard the same way.
+            merged_headers = merged_headers or {}
             merged_headers["content-type"] = "application/json"
         elif data is not None:
             if isinstance(data, dict):
@@ -3348,7 +3591,7 @@ class Session:
         options = {}
         if merged_headers:
             options["headers"] = merged_headers
-        options_json = json.dumps(options).encode("utf-8") if options else None
+        options_json = _json.dumps(options).encode("utf-8") if options else None
 
         start_time = time.perf_counter()
         response_handle = self._lib.httpcloak_post_raw(
@@ -3361,7 +3604,7 @@ class Session:
         elapsed = time.perf_counter() - start_time
 
         if response_handle < 0:
-            raise HTTPCloakError("Request failed")
+            raise HTTPCloakError(_last_error(self._lib, self._handle))
 
         return _parse_fast_response(self._lib, response_handle, elapsed=elapsed)
 
@@ -3370,8 +3613,11 @@ class Session:
         method: str,
         url: str,
         data: Optional[Union[str, bytes, Dict[str, Any]]] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
+        exact_headers: Optional[Sequence[Tuple[str, str]]] = None,
+        header_order: Optional[Sequence[str]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         auth: Optional[Tuple[str, str]] = None,
@@ -3407,6 +3653,12 @@ class Session:
             requests. If you need to keep the data, copy it with bytes(r.content).
         """
         # Use request auth if provided, otherwise fall back to session auth
+        # exact_headers replaces the whole header pipeline: the pairs go out in
+        # the order and casing given, a name may repeat, and no preset headers,
+        # client hints or alphabetical tail are added. A dict cannot express any
+        # of that, which is why this takes a sequence of pairs.
+        _exact = [[str(k), str(v)] for k, v in exact_headers] if exact_headers else None
+        json_data = _resolve_json_alias(json, json_data)
         effective_auth = auth if auth is not None else self.auth
 
         url = _add_params_to_url(url, params)
@@ -3418,8 +3670,13 @@ class Session:
         body_bytes = None
         body_len = 0
         if json_data is not None:
-            body_bytes = json.dumps(json_data).encode("utf-8")
+            body_bytes = _json.dumps(json_data).encode("utf-8")
             body_len = len(body_bytes)
+            # _apply_cookies returns None when there are neither headers nor
+            # cookies, so this assignment used to raise TypeError and a JSON
+            # body with no headers could not be sent at all. The sync methods
+            # already guard the same way.
+            merged_headers = merged_headers or {}
             merged_headers["content-type"] = "application/json"
         elif data is not None:
             if isinstance(data, dict):
@@ -3438,12 +3695,20 @@ class Session:
             "method": method.upper(),
             "url": url,
         }
+        if _exact:
+            request_config["exact_headers"] = _exact
+        # A per-request order overrides whatever set_header_order installed and
+        # stores nothing on the session, so concurrent requests can each carry
+        # their own. It is a prefix: names listed here go first, in this order,
+        # and anything left out keeps the preset's own position.
+        if header_order:
+            request_config["header_order"] = [str(h) for h in header_order]
         if merged_headers:
             request_config["headers"] = merged_headers
         if timeout:
             request_config["timeout"] = timeout
 
-        request_json = json.dumps(request_config).encode("utf-8")
+        request_json = _json.dumps(request_config).encode("utf-8")
 
         start_time = time.perf_counter()
         response_handle = self._lib.httpcloak_request_raw(
@@ -3455,7 +3720,7 @@ class Session:
         elapsed = time.perf_counter() - start_time
 
         if response_handle < 0:
-            raise HTTPCloakError("Request failed")
+            raise HTTPCloakError(_last_error(self._lib, self._handle))
 
         return _parse_fast_response(self._lib, response_handle, elapsed=elapsed)
 
@@ -3463,6 +3728,7 @@ class Session:
         self,
         url: str,
         data: Optional[Union[str, bytes, Dict[str, Any]]] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -3486,6 +3752,7 @@ class Session:
         Returns:
             FastResponse with memoryview content
         """
+        json_data = _resolve_json_alias(json, json_data)
         return self.request_fast(
             "PUT", url, data=data, json_data=json_data, params=params,
             headers=headers, cookies=cookies, auth=auth, timeout=timeout,
@@ -3523,6 +3790,7 @@ class Session:
         self,
         url: str,
         data: Optional[Union[str, bytes, Dict[str, Any]]] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -3546,6 +3814,7 @@ class Session:
         Returns:
             FastResponse with memoryview content
         """
+        json_data = _resolve_json_alias(json, json_data)
         return self.request_fast(
             "PATCH", url, data=data, json_data=json_data, params=params,
             headers=headers, cookies=cookies, auth=auth, timeout=timeout,
@@ -3563,6 +3832,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> StreamResponse:
         """Internal method to perform a streaming GET request."""
         url = _add_params_to_url(url, params)
@@ -3584,6 +3854,8 @@ class Session:
             options["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             options["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            options["disable_redirect_referer"] = True
         options_json = json.dumps(options).encode("utf-8") if options else None
 
         # Start stream
@@ -3633,12 +3905,14 @@ class Session:
             protocol=metadata.get("protocol", ""),
             content_length=metadata.get("content_length", -1),
             cookies=cookies_list,
+            header_order=metadata.get("header_order") or [],
         )
 
     def post_stream(
         self,
         url: str,
         data: Union[str, bytes, Dict, None] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -3649,6 +3923,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> StreamResponse:
         """
         Perform a streaming POST request.
@@ -3666,12 +3941,13 @@ class Session:
         Returns:
             StreamResponse for streaming the response body
         """
+        json_data = _resolve_json_alias(json, json_data)
         url = _add_params_to_url(url, params)
         merged_headers = self._merge_headers(headers)
 
         body = None
         if json_data is not None:
-            body = json.dumps(json_data).encode("utf-8")
+            body = _json.dumps(json_data).encode("utf-8")
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
         elif data is not None:
@@ -3702,7 +3978,9 @@ class Session:
             options["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             options["disable_high_entropy_client_hints"] = True
-        options_json = json.dumps(options).encode("utf-8") if options else None
+        if disable_redirect_referer:
+            options["disable_redirect_referer"] = True
+        options_json = _json.dumps(options).encode("utf-8") if options else None
 
         # Start stream
         stream_handle = self._lib.httpcloak_stream_post(
@@ -3722,7 +4000,7 @@ class Session:
             self._lib.httpcloak_stream_close(stream_handle)
             raise HTTPCloakError("Failed to get stream metadata")
 
-        metadata = json.loads(metadata_str)
+        metadata = _json.loads(metadata_str)
         if "error" in metadata:
             self._lib.httpcloak_stream_close(stream_handle)
             raise HTTPCloakError(metadata["error"])
@@ -3752,7 +4030,110 @@ class Session:
             protocol=metadata.get("protocol", ""),
             content_length=metadata.get("content_length", -1),
             cookies=cookies_list,
+            header_order=metadata.get("header_order") or [],
         )
+
+    async def request_stream_async(
+        self,
+        method: str,
+        url: str,
+        data: Union[str, bytes, None] = None,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        cookies: Optional[Dict[str, str]] = None,
+        auth: Optional[Tuple[str, str]] = None,
+        timeout: Optional[int] = None,
+        allow_redirects: Optional[bool] = None,
+        disable_conditional_cache: bool = False,
+        disable_client_hints: bool = False,
+        disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
+        exact_headers: Optional[Sequence[Tuple[str, str]]] = None,
+        header_order: Optional[Sequence[str]] = None,
+    ) -> StreamResponse:
+        """
+        Open a streaming request without blocking the event loop.
+
+        Every other streaming method blocks the calling thread until the
+        response headers arrive, which in an asyncio program stalls every other
+        coroutine for the length of a DNS lookup, a TCP connect and a TLS
+        handshake. This awaits that instead: the Go side runs the request on its
+        own goroutine and resolves the future when the headers land.
+
+        Only the opening is asynchronous. The returned StreamResponse reads its
+        body with the same synchronous methods as the rest, so wrap those in
+        asyncio.to_thread if the body is large enough to matter.
+
+        Args:
+            method: HTTP method (GET, POST, PUT, etc.)
+            url: Request URL
+            data: Request body
+            params: URL query parameters
+            headers: Request headers
+            cookies: Cookies to send with this request
+            auth: Basic auth tuple (username, password)
+            timeout: Request timeout in seconds
+            exact_headers: Replaces the whole header pipeline, see request()
+            header_order: Header order for this request only
+
+        Returns:
+            StreamResponse, already open, body not yet read
+
+        Example:
+            resp = await session.request_stream_async("GET", url)
+            try:
+                for chunk in resp.iter_content(8192):
+                    ...
+            finally:
+                resp.close()
+        """
+        url = _add_params_to_url(url, params)
+        merged_headers = self._merge_headers(headers)
+        effective_auth = auth if auth is not None else self.auth
+        merged_headers = _apply_auth(merged_headers, effective_auth)
+        merged_headers = self._apply_cookies(merged_headers, cookies)
+
+        request_config: Dict[str, Any] = {
+            "method": method.upper(),
+            "url": url,
+        }
+        if exact_headers:
+            request_config["exact_headers"] = [[str(k), str(v)] for k, v in exact_headers]
+        if header_order:
+            request_config["header_order"] = [str(h) for h in header_order]
+        if merged_headers:
+            request_config["headers"] = merged_headers
+        if data is not None:
+            request_config["body"] = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+        if timeout:
+            request_config["timeout"] = int(timeout * 1000)
+        if allow_redirects is not None:
+            request_config["follow_redirects"] = bool(allow_redirects)
+        if disable_conditional_cache:
+            request_config["disable_conditional_cache"] = True
+        if disable_client_hints:
+            request_config["disable_client_hints"] = True
+        if disable_high_entropy_client_hints:
+            request_config["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            request_config["disable_redirect_referer"] = True
+
+        manager = _get_async_manager()
+        callback_id, future = manager.register_request(self._lib)
+        self._lib.httpcloak_stream_request_async(
+            self._handle,
+            _json.dumps(request_config).encode("utf-8"),
+            callback_id,
+        )
+        return await future
+
+    async def get_stream_async(self, url: str, **kwargs) -> StreamResponse:
+        """GET, streamed, without blocking the event loop. See request_stream_async."""
+        return await self.request_stream_async("GET", url, **kwargs)
+
+    async def post_stream_async(self, url: str, data: Union[str, bytes, None] = None, **kwargs) -> StreamResponse:
+        """POST, streamed, without blocking the event loop. See request_stream_async."""
+        return await self.request_stream_async("POST", url, data=data, **kwargs)
 
     def request_stream(
         self,
@@ -3768,6 +4149,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> StreamResponse:
         """
         Perform a streaming HTTP request with any method.
@@ -3813,6 +4195,8 @@ class Session:
             request_config["disable_client_hints"] = True
         if disable_high_entropy_client_hints:
             request_config["disable_high_entropy_client_hints"] = True
+        if disable_redirect_referer:
+            request_config["disable_redirect_referer"] = True
 
         # Start stream
         stream_handle = self._lib.httpcloak_stream_request(
@@ -3860,6 +4244,7 @@ class Session:
             protocol=metadata.get("protocol", ""),
             content_length=metadata.get("content_length", -1),
             cookies=cookies_list,
+            header_order=metadata.get("header_order") or [],
         )
 
     def get_stream(
@@ -3874,6 +4259,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> StreamResponse:
         """
         Perform a streaming GET request.
@@ -3904,13 +4290,14 @@ class Session:
             allow_redirects=allow_redirects,
             disable_conditional_cache=disable_conditional_cache,
             disable_client_hints=disable_client_hints,
-            disable_high_entropy_client_hints=disable_high_entropy_client_hints,
+            disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer,
         )
 
     def put_stream(
         self,
         url: str,
         data: Union[str, bytes, Dict, None] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -3921,6 +4308,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> StreamResponse:
         """
         Perform a streaming PUT request.
@@ -3938,12 +4326,13 @@ class Session:
         Returns:
             StreamResponse for streaming the response body
         """
+        json_data = _resolve_json_alias(json, json_data)
         url = _add_params_to_url(url, params)
         merged_headers = self._merge_headers(headers)
 
         body = None
         if json_data is not None:
-            body = json.dumps(json_data)
+            body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
         elif data is not None:
@@ -3962,7 +4351,7 @@ class Session:
             allow_redirects=allow_redirects,
             disable_conditional_cache=disable_conditional_cache,
             disable_client_hints=disable_client_hints,
-            disable_high_entropy_client_hints=disable_high_entropy_client_hints,
+            disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer,
         )
 
     def delete_stream(
@@ -3977,6 +4366,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> StreamResponse:
         """
         Perform a streaming DELETE request.
@@ -3998,13 +4388,14 @@ class Session:
             allow_redirects=allow_redirects,
             disable_conditional_cache=disable_conditional_cache,
             disable_client_hints=disable_client_hints,
-            disable_high_entropy_client_hints=disable_high_entropy_client_hints,
+            disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer,
         )
 
     def patch_stream(
         self,
         url: str,
         data: Union[str, bytes, Dict, None] = None,
+        json: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -4015,6 +4406,7 @@ class Session:
         disable_conditional_cache: bool = False,
         disable_client_hints: bool = False,
         disable_high_entropy_client_hints: bool = False,
+        disable_redirect_referer: bool = False,
     ) -> StreamResponse:
         """
         Perform a streaming PATCH request.
@@ -4032,12 +4424,13 @@ class Session:
         Returns:
             StreamResponse for streaming the response body
         """
+        json_data = _resolve_json_alias(json, json_data)
         url = _add_params_to_url(url, params)
         merged_headers = self._merge_headers(headers)
 
         body = None
         if json_data is not None:
-            body = json.dumps(json_data)
+            body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
             merged_headers.setdefault("Content-Type", "application/json")
         elif data is not None:
@@ -4056,7 +4449,7 @@ class Session:
             allow_redirects=allow_redirects,
             disable_conditional_cache=disable_conditional_cache,
             disable_client_hints=disable_client_hints,
-            disable_high_entropy_client_hints=disable_high_entropy_client_hints,
+            disable_high_entropy_client_hints=disable_high_entropy_client_hints, disable_redirect_referer=disable_redirect_referer,
         )
 
 
@@ -5219,3 +5612,33 @@ def request(method: str, url: str, **kwargs) -> Response:
     finally:
         if is_temp:
             session.close()
+
+
+def trim_memory() -> None:
+    """
+    Return freed memory to the operating system, blocking until it has.
+
+    Closing a session makes its memory collectable, which is a different thing
+    from giving it back. Go's allocator releases pages lazily and on Linux does
+    so with MADV_FREE, which leaves them counted against the process until the
+    kernel actually wants them, so RSS stays flat long after the sessions are
+    gone. Measured over 150 sessions each doing a real TLS request: 85MB
+    resident, and closing all of them then collecting moved it by under three
+    megabytes, upward.
+
+    This is a ceiling rather than a leak. It is bounded by how many sessions are
+    alive at once, and a long-running process reuses those pages for the next
+    batch. Reach for it when the ceiling is itself the problem: a worker that
+    has finished a batch and will now idle, a memory-capped container, or a
+    fork-per-job model measuring RSS.
+
+    It is deliberately not part of Session.close(). It stops the world for a
+    full collection, so closing sessions in a loop would pay that every time,
+    which is worst for the callers that close the most. One call between
+    batches costs the same collection and returns the same memory.
+
+    Process-wide, not per session: the runtime has one heap and this hands back
+    all of the free part of it.
+    """
+    lib = _get_lib()
+    lib.httpcloak_trim_memory()

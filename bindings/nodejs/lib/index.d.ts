@@ -41,6 +41,26 @@ export class Response {
   statusCode: number;
   /** Response headers */
   headers: Record<string, string>;
+
+  /**
+   * The order the server sent its headers in, lowercase, one entry per
+   * occurrence. Empty on HTTP/1.1, which reads through a parser that
+   * canonicalises and reorders before the binding sees it.
+   */
+  headerOrder: string[];
+
+  /**
+   * The same names as the server spelled them. Pair with headerOrder to
+   * reproduce a response header block exactly, which an object cannot do.
+   * Empty on HTTP/2 and HTTP/3, where field names are lowercase by definition.
+   */
+  headerCasing: string[];
+
+  /**
+   * The trailing header block sent after the body, lowercase keys. Empty when
+   * there was none. gRPC carries its status here.
+   */
+  trailer: Record<string, string[]>;
   /** Raw response body as Buffer */
   body: Buffer;
   /** Response body as Buffer (alias for body) */
@@ -334,6 +354,55 @@ export interface RequestOptions {
    * -full-version-list). One-off only; the session-wide setting is untouched.
    */
   disableHighEntropyClientHints?: boolean;
+
+  /**
+   * Per-request opt-out of the Referer httpcloak adds when it follows a
+   * redirect. When true no Referer is synthesised for the next hop; a Referer
+   * the caller set themselves still goes out.
+   */
+  disableRedirectReferer?: boolean;
+
+  /**
+   * Replace the whole header pipeline for this request.
+   *
+   * The pairs go on the wire in the order and casing given, and nothing else
+   * is added: no preset header block, no client hints, no Sec-Fetch inference,
+   * no alphabetical tail, and no merge of `headers` or the session cookie jar.
+   * A name may repeat and each occurrence keeps its own position, which an
+   * object cannot express and a captured request routinely needs.
+   *
+   * Host on HTTP/1.1 and the pseudo-header block on HTTP/2 and HTTP/3 are
+   * still written for you as protocol framing. Connection is not; list it
+   * yourself to send it.
+   *
+   * Honoured by `request`, `requestSync` and `requestStream`. It is an escape
+   * hatch: the caller takes on the entire request shape, including the headers
+   * a browser would always send.
+   *
+   * @example
+   * await session.request("GET", "https://example.com", {
+   *   exactHeaders: [
+   *     ["cookie", "a=1"],
+   *     ["accept", "*\/*"],
+   *     ["cookie", "b=2"],
+   *   ],
+   * });
+   */
+  exactHeaders?: Array<[string, string]> | Map<string, string> | Record<string, string>;
+
+  /**
+   * Header order for this one request, overriding any session-wide order.
+   * Nothing is stored on the session, so concurrent requests can each carry
+   * their own.
+   *
+   * It is a prefix rather than a replacement: names listed here go first, in
+   * this order, and anything left out keeps the preset's own position. Use it
+   * instead of setting a session-wide order around a request, which races with
+   * everything else in flight.
+   *
+   * Honoured by `request`, `requestSync` and `requestStream`.
+   */
+  headerOrder?: string[];
 
   /**
    * AbortSignal for cancelling an in-flight request. Honored by the async
@@ -1388,3 +1457,14 @@ export class PresetPool {
   /** Free the pool handle and unregister all its presets. */
   close(): void;
 }
+
+/**
+ * Return freed memory to the operating system, blocking until it has.
+ *
+ * Closing a session makes its memory collectable, which is not the same as
+ * giving it back: Go releases pages lazily and RSS stays flat long after the
+ * sessions are gone. Deliberately not part of close(), because it stops the
+ * world for a full collection and a loop closing sessions would pay that every
+ * time. Call it once between batches. Process-wide, not per session.
+ */
+export function trimMemory(): void;

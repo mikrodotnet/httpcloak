@@ -19,7 +19,7 @@ The dispatcher in `transport/transport.go` is one function, `doAuto`. The steps 
 3. Take the first success. Cancel the loser.
 4. If H2's TLS handshake came back with `http/1.1` in ALPN (`ALPNMismatchError`), reuse that same TLS connection for an H1 request. No second handshake.
 5. If both attempts fail (or the 6-second race budget elapses), fall through to H1 on a fresh TCP connection. There's no extra H2 retry; H2 already had its shot inside the race.
-6. Cache the winning protocol in `protocolSupport[host]` so the next request to the same host skips the race.
+6. Cache the winning protocol in `protocolSupport[host]` so the next request to the same host skips the race. Step 5's fallback is the exception: an H1 response served only because the H2 attempt failed says nothing about the host, so it is not cached, and the next request races again. An ALPN downgrade (step 4) is a fact about the host and is cached.
 
 The race lives in `raceH3H2`. It dodges the 5-second wall you'd hit when H3 went first and the network silently swallowed UDP/443. With the race, H2 fills in the moment TCP comes back, usually under 200ms.
 
@@ -185,7 +185,7 @@ A request to `example.com` that comes back on H3 leaves a marker in the cache. T
 A planned `BrokenAltSvc` circuit breaker would suppress H3 attempts after repeated failures to a specific host without forcing a restart. Tracked in our internal docs, not landed yet.
 
 :::tip Auto vs forced for production
-For production traffic where the protocol doesn't matter, leave it on auto. The lib handles Alt-Svc, the H3 race, and ALPN fallback. For automation aimed at specific bot products, force the protocol the preset is shaped for. Most `chrome-148` presets are tuned for H2 and H3 side by side, but matching against a capture taken specifically on H3 needs H3 forced so the diff doesn't accidentally compare against an H2 fingerprint.
+For production traffic where the protocol doesn't matter, leave it on auto. The lib handles Alt-Svc, the H3 race, and ALPN fallback. For automation aimed at specific bot products, force the protocol the preset is shaped for. Most `chrome-152` presets are tuned for H2 and H3 side by side, but matching against a capture taken specifically on H3 needs H3 forced so the diff doesn't accidentally compare against an H2 fingerprint.
 :::
 
 ## See also

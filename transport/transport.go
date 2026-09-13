@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -207,6 +208,35 @@ type Request struct {
 
 	Timeout time.Duration
 
+	// ExactHeaders, when non-empty, replaces the whole header pipeline for this
+	// request. The pairs go on the wire in the order and the casing given and
+	// nothing else is added: no preset header block, no client hints, no
+	// Sec-Fetch inference, no alphabetical tail for names the preset does not
+	// know, and no merge of the Headers map, which is where the session writes
+	// its cookie jar.
+	//
+	// A name may repeat, and each occurrence keeps its own position rather than
+	// collapsing onto the first. Every encoder reads the order list as one slot
+	// per field and hands slot i the value at index i.
+	//
+	// It exists because the normal path is opinionated in three ways that a
+	// mirror cannot live with. It always injects the preset block, it appends
+	// unknown caller headers sorted alphabetically at the end, and it
+	// canonicalises casing through http.Header.Set. On top of that a
+	// map[string][]string cannot express two headers of the same name in a
+	// chosen position relative to other names.
+	//
+	// This is a deliberate escape hatch, not the default. A caller using it
+	// takes on responsibility for the entire request shape, including the
+	// headers a browser would always send.
+	//
+	// Host on HTTP/1.1 and the pseudo-header block on HTTP/2 and HTTP/3 are
+	// still written for you, because they are protocol framing rather than
+	// caller headers. Connection is not: a capture that carries none cannot
+	// have one added back, and HTTP/1.1 keeps the connection alive by default
+	// anyway, so nothing is lost by leaving it out.
+	ExactHeaders []fingerprint.HeaderPair
+
 	// TLSOnly is a per-request override for TLS-only mode.
 	// When set to true, preset HTTP headers are NOT applied - only TLS fingerprinting is used.
 	// When nil, the transport's TLSOnly setting is used.
@@ -238,6 +268,21 @@ type Request struct {
 	// trio but tells the session layer to skip the high-entropy hints for this
 	// request. Session-layer concept; the transport does not consult this field.
 	DisableHighEntropyClientHints bool
+
+	// DisableRedirectReferer, when true, stops the session layer synthesising a
+	// Referer on each redirect hop. Session-layer concept; the transport does
+	// not consult this field.
+	//
+	// The synthesised value follows Chrome's default
+	// strict-origin-when-cross-origin policy, so leaving this off is what a
+	// browser does and is almost always what you want. It exists for callers
+	// mirroring a client that sends no Referer at all, or reproducing a captured
+	// chain verbatim, where a policy-correct header is still the wrong bytes.
+	//
+	// Setting it does not merely skip the synthesis: no Referer is sent on the
+	// hop at all, including one the caller set on the original request, because
+	// carrying that one forward would leak the pre-redirect URL to the new host.
+	DisableRedirectReferer bool
 
 	// HeaderOrder, when non-empty, is the header order for THIS request only and
 	// fully replaces any order installed session-wide with SetHeaderOrder. It is
@@ -375,11 +420,56 @@ type RedirectInfo struct {
 type Response struct {
 	StatusCode int
 	Headers    map[string][]string // Multi-value headers (matches http.Header)
-	Body       io.ReadCloser       // Streaming body - call Close() when done
-	FinalURL   string
-	Timing     *protocol.Timing
-	Protocol   string // "h1", "h2", or "h3"
-	History    []*RedirectInfo
+
+	// HeaderOrder is the order the peer sent its headers in, lowercase, one
+	// entry per occurrence. Headers is a map and cannot carry order, so a
+	// caller relaying this response onward would otherwise emit a different
+	// sequence than the origin did.
+	//
+	// Nil when the protocol path did not record one. HTTP/2 and HTTP/3 decode
+	// an ordered field list and record it for free; HTTP/1.1 reads through
+	// textproto, which canonicalises the names and drops the order, so it
+	// reports nil.
+	HeaderOrder []string
+
+	// HeaderCasing is the response header names as the server spelled them, in
+	// arrival order, for HTTP/1.1 only.
+	//
+	// HTTP/2 and HTTP/3 require lowercase names on the wire, so there is no
+	// casing to report and this stays nil. On HTTP/1.1 the parse underneath
+	// canonicalises (a server's `X-FOO` is reported as `X-Foo`), so anything
+	// relaying a response onward would otherwise emit a spelling the origin did
+	// not use.
+	//
+	// Best-effort: nil when the header block was not fully buffered by the time
+	// the response was read. Headers is always populated either way, and
+	// HeaderOrder carries the same names lowercased.
+	HeaderCasing []string
+
+	// Trailer carries the trailing header block a server may send after the
+	// body, lowercase-keyed like Headers. Nil when the response had none, which
+	// is almost all of them.
+	//
+	// It matters for gRPC, where the call's status code and message arrive here
+	// rather than in the response headers: a gRPC response is a 200 with the
+	// real outcome in `grpc-status`, so a client that drops trailers reports
+	// every failed call as a success.
+	//
+	// Only populated once the body has been read, because that is when the
+	// trailing block arrives. The transport buffers the body before returning,
+	// so it is ready by the time a caller sees this. On a streamed response it
+	// fills in after the body reaches io.EOF.
+	//
+	// HTTP/1.1 carries trailers only on a chunked response that announced them
+	// in a Trailer header; HTTP/2 and HTTP/3 carry them as a second header
+	// block.
+	Trailer map[string][]string
+
+	Body     io.ReadCloser // Streaming body - call Close() when done
+	FinalURL string
+	Timing   *protocol.Timing
+	Protocol string // "h1", "h2", or "h3"
+	History  []*RedirectInfo
 
 	// bodyBytes caches the body after reading for multiple access
 	bodyBytes []byte
@@ -651,6 +741,28 @@ func proxyURLWithCreds(rawURL, username, password string) string {
 	return u.String()
 }
 
+// narrowDNSToLocalFamily keeps the shared DNS cache in step with a source
+// address set after construction, through one of the per-protocol
+// SetLocalAddr methods.
+//
+// Only the constructor sees the single address all three protocol transports
+// were configured with. A later change reaches one of them, while its siblings
+// keep the address they were built with and go on filtering against it, so
+// narrowing the cache to the new family could leave another protocol with
+// nothing it is willing to dial. Anything other than a rebind inside the
+// current family therefore lifts the restriction and goes back to resolving
+// both, which is what this library did before the restriction existed. No
+// configuration reachable this way ends up worse off than it was.
+func narrowDNSToLocalFamily(cache *dns.Cache, addr string) {
+	if cache == nil {
+		return
+	}
+	if dns.NetworkForLocalAddr(addr) == cache.Network() {
+		return
+	}
+	cache.SetNetwork("")
+}
+
 // NewTransportWithConfig creates a new unified transport with proxy and config
 func NewTransportWithConfig(presetName string, proxy *ProxyConfig, config *TransportConfig) *Transport {
 	preset := fingerprint.Get(presetName)
@@ -659,6 +771,14 @@ func NewTransportWithConfig(presetName string, proxy *ProxyConfig, config *Trans
 	// Determine TLS-only mode from config
 	tlsOnly := false
 	if config != nil {
+		// A bound source address decides the address family for every connection
+		// this transport makes, so records of the other family cannot be dialled.
+		// All three protocol transports already drop them, filtering the resolved
+		// set against the bound family before they dial. Telling the resolver up
+		// front means those records are never looked up, which removes one of the
+		// two queries getaddrinfo makes for an unrestricted lookup.
+		dnsCache.SetNetwork(dns.NetworkForLocalAddr(config.LocalAddr))
+
 		tlsOnly = config.TLSOnly
 
 		// Override preset HTTP/2 settings with custom Akamai fingerprint
@@ -1462,9 +1582,13 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 	if snap.preset.SupportHTTP3 && snap.h3 != nil {
 		resp, protocol, err := t.raceH3H2(ctx, req)
 		if err == nil {
-			t.protocolSupportMu.Lock()
-			t.protocolSupport[host] = protocol
-			t.protocolSupportMu.Unlock()
+			// ProtocolAuto means the response came from the HTTP/1.1 fallback
+			// after a non-ALPN H2 failure: nothing was learned about the host.
+			if protocol != ProtocolAuto {
+				t.protocolSupportMu.Lock()
+				t.protocolSupport[host] = protocol
+				t.protocolSupportMu.Unlock()
+			}
 			return resp, nil
 		}
 		// Check if ALPN mismatch from H2 - reuse connection
@@ -1501,16 +1625,24 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 		}
 	}
 
-	// Fallback to HTTP/1.1 with new connection
+	// Fallback to HTTP/1.1 with new connection.
+	//
+	// Deliberately not cached. Every other HTTP/1.1 entry in protocolSupport
+	// comes from an ALPN downgrade or from a preset that disables H2, both of
+	// which hold for every request to the host. This path is reached when the
+	// H2 (or H3/H2) attempt failed for any other reason, most often a transient
+	// one such as a reset or timed-out handshake, and the fallback merely got
+	// the request through. Caching it pinned the host to HTTP/1.1 for the rest
+	// of the session with nothing that would ever re-probe it, so one bad
+	// handshake on the first request to a host silently downgraded every later
+	// request, and the fingerprint with them. Leaving the host uncached costs
+	// nothing on the next request beyond re-attempting H2, which is exactly what
+	// should happen; if that succeeds the host is cached as H2.
 	resp, err := t.doHTTP1(ctx, req)
-	if err == nil {
-		t.protocolSupportMu.Lock()
-		t.protocolSupport[host] = ProtocolHTTP1
-		t.protocolSupportMu.Unlock()
-		return resp, nil
+	if err != nil {
+		return nil, err
 	}
-
-	return nil, err
+	return resp, nil
 }
 
 // connectResult holds the result of a connection race
@@ -1558,12 +1690,22 @@ func (t *Transport) raceConnectProtocol(ctx context.Context, host, port string) 
 }
 
 // raceTwoProbes runs the H3 and H2 connection probes concurrently under a
-// shared cancellable context and returns as soon as one connects, or when the
-// H2 probe reports an ALPN downgrade to HTTP/1.1, or when the budget elapses
-// (default to H2 then). The losing probe is cancelled. budget bounds the wait
-// so a blocked H3 probe cannot stall the caller. Split out from
-// raceConnectProtocol so the race/timeout logic is unit-testable with injected
-// probes.
+// shared cancellable context and returns as soon as one connects, when the H2
+// probe reports an ALPN downgrade to HTTP/1.1, when BOTH probes have failed, or
+// when the budget elapses (default to H2 then). The losing probe is cancelled.
+// budget bounds the wait so a blocked H3 probe cannot stall the caller. Split
+// out from raceConnectProtocol so the race/timeout logic is unit-testable with
+// injected probes.
+//
+// The both-failed case matters more than it looks. Each goroutine used to
+// signal only on success, so a plain error from either was dropped on the
+// floor and the race sat out the entire budget even when both probes had
+// already given up. Measured against a host that does not resolve: every
+// forced protocol reported "no such host" in 20 to 130ms, while auto mode took
+// 6005ms, the budget almost exactly. Any request with a timeout under the
+// budget therefore died as "context deadline exceeded" and the real reason
+// never reached the caller. That applies to every fast failure, not just
+// NXDOMAIN: connection refused, no route to host, a rejected handshake.
 func raceTwoProbes(ctx context.Context, budget time.Duration, h3Probe, h2Probe func(context.Context) error) connectDecision {
 	raceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1571,6 +1713,17 @@ func raceTwoProbes(ctx context.Context, budget time.Duration, h3Probe, h2Probe f
 	winnerCh := make(chan Protocol, 1)
 	alpnErrCh := make(chan *ALPNMismatchError, 1)
 	doneCh := make(chan struct{})
+	// bothFailedCh closes once each probe has reported a failure that is not an
+	// ALPN downgrade, so a race nobody can win ends now instead of at the
+	// budget. An ALPN mismatch is not a failure here: it resolves the race on
+	// alpnErrCh and hands the caller a live connection.
+	bothFailedCh := make(chan struct{})
+	var failures atomic.Int32
+	noteFailure := func() {
+		if failures.Add(1) == 2 {
+			close(bothFailedCh)
+		}
+	}
 	// h2Done closes when the H2 probe goroutine has fully returned. The drainer
 	// (see drainLateALPN) waits on it so a late ALPN downgrade — an *ALPNMismatchError
 	// carrying a live *utls.UConn that the probe emits AFTER the race resolved —
@@ -1584,7 +1737,9 @@ func raceTwoProbes(ctx context.Context, budget time.Duration, h3Probe, h2Probe f
 			case winnerCh <- ProtocolHTTP3:
 			default:
 			}
+			return
 		}
+		noteFailure()
 	}()
 
 	// Race HTTP/2 connection
@@ -1604,6 +1759,8 @@ func raceTwoProbes(ctx context.Context, budget time.Duration, h3Probe, h2Probe f
 				case alpnErrCh <- alpnErr:
 				default:
 				}
+			} else {
+				noteFailure()
 			}
 		}
 	}()
@@ -1630,6 +1787,19 @@ func raceTwoProbes(ctx context.Context, budget time.Duration, h3Probe, h2Probe f
 		// This alpnErr's conn is handed to the caller to reuse; do NOT close it
 		// and do NOT drain (the probe emits exactly one alpnErr).
 		return connectDecision{alpnErr: alpnErr}
+	case <-bothFailedCh:
+		cancel()
+		// Same outcome as the budget path, just without the wait: the caller
+		// falls back to H2 then H1, which fail fast now that DNS or the dial
+		// has already answered, and produces the real error instead of a
+		// deadline.
+		select {
+		case alpnErr := <-alpnErrCh:
+			return connectDecision{alpnErr: alpnErr}
+		default:
+		}
+		drainLateALPN(h2Done, alpnErrCh)
+		return connectDecision{protocol: ProtocolHTTP2}
 	case <-doneCh:
 		cancel()
 		select {
@@ -1672,6 +1842,12 @@ func drainLateALPN(h2Done <-chan struct{}, alpnErrCh <-chan *ALPNMismatchError) 
 // raceH3H2 races HTTP/3 and HTTP/2 connections in parallel, then makes the request
 // on whichever protocol connects first. This eliminates the 5-second delay when
 // HTTP/3 (QUIC) is blocked by firewalls or VPNs.
+//
+// The returned Protocol is what was learned about the host, for the caller to
+// cache: HTTP3 or HTTP2 when that protocol connected and served the request,
+// HTTP1 when ALPN negotiated http/1.1. ProtocolAuto means the request was served
+// by the HTTP/1.1 fallback after a non-ALPN H2 failure, which says nothing about
+// the host and must not be cached. It is only meaningful when err is nil.
 func (t *Transport) raceH3H2(ctx context.Context, req *Request) (*Response, Protocol, error) {
 	// Parse URL to get host:port
 	parsedURL, err := url.Parse(req.URL)
@@ -1710,9 +1886,12 @@ func (t *Transport) raceH3H2(ctx context.Context, req *Request) (*Response, Prot
 				resp, err := t.doHTTP1WithTLSConn(ctx, req, alpnErr)
 				return resp, ProtocolHTTP1, err
 			}
-			// H2 failed for other reason, try H1 with new connection
+			// H2 failed for other reason, try H1 with new connection. This is
+			// a fallback, not a negotiation: it says nothing about what the
+			// host speaks, so report ProtocolAuto and let doAuto leave the host
+			// uncached rather than pin it to HTTP/1.1 (see doAuto's fallback).
 			resp, err = t.doHTTP1(ctx, req)
-			return resp, ProtocolHTTP1, err
+			return resp, ProtocolAuto, err
 		}
 		return resp, ProtocolHTTP2, nil
 	}
@@ -1787,19 +1966,9 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 
 	// Set preset headers (with ordering for fingerprinting)
 	// Pass "h1" protocol so Chrome presets don't send Priority header on HTTP/1.1
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints)
+	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	// Override with custom headers (multi-value support)
-	// Use Set for first value to replace preset headers, Add for additional values
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
-	}
+	mergeCallerHeaders(httpReq, req)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -1835,14 +2004,17 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   req.URL,
-		Timing:     timing,
-		Protocol:   "h1",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:   resp.StatusCode,
+		Headers:      headers,
+		HeaderOrder:  responseHeaderOrder(resp.Header),
+		HeaderCasing: takeHeaderCasing(resp.Header),
+		Trailer:      buildTrailerMap(resp.Trailer),
+		Body:         io.NopCloser(bytes.NewReader(body)),
+		FinalURL:     req.URL,
+		Timing:       timing,
+		Protocol:     "h1",
+		bodyBytes:    body,
+		bodyRead:     true,
 	}, nil
 }
 
@@ -1899,19 +2071,9 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 	}
 
 	// Set preset headers - pass "h1" protocol so Chrome presets don't send Priority header
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints)
+	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	// Override with custom headers (multi-value support)
-	// Use Set for first value to replace preset headers, Add for additional values
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
-	}
+	mergeCallerHeaders(httpReq, req)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -1947,14 +2109,17 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   parsedURL.String(),
-		Timing:     timing,
-		Protocol:   "h1",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:   resp.StatusCode,
+		Headers:      headers,
+		HeaderOrder:  responseHeaderOrder(resp.Header),
+		HeaderCasing: takeHeaderCasing(resp.Header),
+		Trailer:      buildTrailerMap(resp.Trailer),
+		Body:         io.NopCloser(bytes.NewReader(body)),
+		FinalURL:     parsedURL.String(),
+		Timing:       timing,
+		Protocol:     "h1",
+		bodyBytes:    body,
+		bodyRead:     true,
 	}, nil
 }
 
@@ -2018,19 +2183,9 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	}
 
 	// Set preset headers (with ordering for fingerprinting)
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers, req.DisableClientHints)
+	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	// Override with custom headers (multi-value support)
-	// Use Set for first value to replace preset headers, Add for additional values
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
-	}
+	mergeCallerHeaders(httpReq, req)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -2062,18 +2217,22 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
-	// Calculate timing breakdown
-	wasReused := useCountBefore >= 1
-	if wasReused {
-		timing.DNSLookup = 0
-		timing.TCPConnect = 0
-		timing.TLSHandshake = 0
-	} else {
-		connectionOverhead := timing.FirstByte * 0.7
-		if connectionOverhead > 10 {
-			timing.DNSLookup = connectionOverhead * 0.2
-			timing.TCPConnect = connectionOverhead * 0.3
-			timing.TLSHandshake = connectionOverhead * 0.5
+	// Timing breakdown, measured at connection setup.
+	//
+	// This used to be fabricated: DNSLookup, TCPConnect and TLSHandshake were
+	// fixed fractions of FirstByte (0.2, 0.3 and 0.5 of 70% of it), which are
+	// invented numbers in a public API field. Anyone diagnosing latency from
+	// them was reading a reshaped copy of one measurement.
+	//
+	// A reused connection reports zeros, which is what the Timing struct
+	// documents, and so does any phase that was not separable on the path
+	// taken, the proxy dial in particular.
+	if useCountBefore == 0 {
+		if dnsMs, tcpMs, tlsMs, ok := snap.h2.ConnectionSetupTiming(host, port); ok {
+			timing.DNSLookup = dnsMs
+			timing.TCPConnect = tcpMs
+			timing.TLSHandshake = tlsMs
+			timing.Connect = dnsMs + tcpMs + tlsMs
 		}
 	}
 
@@ -2081,14 +2240,17 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   req.URL,
-		Timing:     timing,
-		Protocol:   "h2",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:   resp.StatusCode,
+		Headers:      headers,
+		HeaderOrder:  responseHeaderOrder(resp.Header),
+		HeaderCasing: takeHeaderCasing(resp.Header),
+		Trailer:      buildTrailerMap(resp.Trailer),
+		Body:         io.NopCloser(bytes.NewReader(body)),
+		FinalURL:     req.URL,
+		Timing:       timing,
+		Protocol:     "h2",
+		bodyBytes:    body,
+		bodyRead:     true,
 	}, nil
 }
 
@@ -2152,19 +2314,9 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	}
 
 	// Set preset headers (with ordering for fingerprinting)
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers, req.DisableClientHints)
+	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	// Override with custom headers (multi-value support)
-	// Use Set for first value to replace preset headers, Add for additional values
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
-	}
+	mergeCallerHeaders(httpReq, req)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -2205,34 +2357,37 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
-	// Calculate timing breakdown (HTTP/3 uses QUIC, no TCP)
-	dialCountAfter := t.h3Transport.GetDialCount()
-	wasReused := dialCountAfter == dialCountBefore
+	// Timing breakdown for HTTP/3.
+	//
+	// All three phases stay zero. QUIC folds the transport and TLS handshakes
+	// into one exchange inside quic-go, so there is nothing here to split
+	// without threading measurements out of the fork, and there is no TCP
+	// connect at all. Zero is the value the Timing struct documents for a phase
+	// that did not happen.
+	//
+	// The previous code invented 0.3 and 0.7 shares of FirstByte for DNSLookup
+	// and TLSHandshake, which is a reshaped copy of one measurement presented
+	// as three.
+	_ = dialCountBefore
+	timing.DNSLookup = 0
 	timing.TCPConnect = 0
-
-	if wasReused {
-		timing.DNSLookup = 0
-		timing.TLSHandshake = 0
-	} else {
-		connectionOverhead := timing.FirstByte * 0.7
-		if connectionOverhead > 10 {
-			timing.DNSLookup = connectionOverhead * 0.3
-			timing.TLSHandshake = connectionOverhead * 0.7
-		}
-	}
+	timing.TLSHandshake = 0
 
 	// Build response headers map
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   req.URL,
-		Timing:     timing,
-		Protocol:   "h3",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:   resp.StatusCode,
+		Headers:      headers,
+		HeaderOrder:  responseHeaderOrder(resp.Header),
+		HeaderCasing: takeHeaderCasing(resp.Header),
+		Trailer:      buildTrailerMap(resp.Trailer),
+		Body:         io.NopCloser(bytes.NewReader(body)),
+		FinalURL:     req.URL,
+		Timing:       timing,
+		Protocol:     "h3",
+		bodyBytes:    body,
+		bodyRead:     true,
 	}, nil
 }
 
@@ -2338,6 +2493,23 @@ func isH3Stall(err error) bool {
 func (t *Transport) Close() {
 	t.h1Transport.Close()
 	t.h2Transport.Close()
+	t.h3Transport.Close()
+}
+
+// CloseGraceful closes the transport without interrupting requests that are in
+// flight: no new request is accepted, idle connections close now, and a
+// connection still carrying a response closes once that response's body is
+// done. It returns immediately.
+//
+// HTTP/1.1 connections are only ever closed while idle, so an in-flight one is
+// untouched and closes when its body is finished. HTTP/2 connections with a
+// body still streaming are retired and close when the body finishes, or when
+// the abandoned-body bound reclaims one that is never closed. HTTP/3
+// connections are closed immediately, as by Close: the QUIC layer has no
+// per-request drain.
+func (t *Transport) CloseGraceful() {
+	t.h1Transport.Close()
+	t.h2Transport.CloseGraceful()
 	t.h3Transport.Close()
 }
 
@@ -2558,7 +2730,95 @@ func presetSendsSecFetch(preset *fingerprint.Preset) bool {
 	return false
 }
 
-func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, customHeaderOrder []string, customPseudoOrder []string, tlsOnly bool, protocol string, userHeaders map[string][]string, stripClientHints bool) {
+// applyExactHeaders writes the caller's headers verbatim and returns true when
+// it has taken over. Direct map assignment rather than Header.Set is the point:
+// Set canonicalises the key, and a map entry holding several values is how a
+// repeated header name survives to the wire.
+func applyExactHeaders(httpReq *http.Request, exact []fingerprint.HeaderPair, preset *fingerprint.Preset, customPseudoOrder []string, protocol string) bool {
+	if len(exact) == 0 {
+		return false
+	}
+	for k := range httpReq.Header {
+		delete(httpReq.Header, k)
+	}
+	order := make([]string, 0, len(exact))
+	for _, hp := range exact {
+		httpReq.Header[hp.Key] = append(httpReq.Header[hp.Key], hp.Value)
+		order = append(order, hp.Key)
+	}
+	// One order slot per PAIR, not per name. A map cannot hold position, so the
+	// slot list is what carries it, and each encoder hands slot i the value at
+	// index i of that name's slice. Cookie, Accept, Cookie therefore keeps the
+	// Accept in the middle.
+	//
+	// The old form deduplicated the names, which meant a repeated name emitted
+	// all of its values consecutively at its first slot. That is right for the
+	// one shape a browser produces, several Cookie fields in a row, and wrong
+	// for every capture where two fields of one name sit either side of a
+	// third. A name listed once still emits all of its values, so the preset
+	// path, whose order list is deduplicated by CompleteHeaderOrder, is
+	// untouched.
+	httpReq.Header[http.HeaderOrderKey] = order
+	// Only on HTTP/1.1, where this transport writes the request itself and can
+	// be told to stop supplying Connection. The HTTP/2 and HTTP/3 encoders live
+	// in the fork, whose skip list names exactly two ordering keys and whose
+	// validator rejects any header name containing a colon: a third key here
+	// would fail every exact-headers request on those protocols rather than
+	// being ignored.
+	if protocol == "h1" {
+		httpReq.Header[exactHeadersKey] = []string{"1"}
+	}
+
+	// Pseudo-header order is still the preset's. It is part of the protocol
+	// framing rather than something the caller listed, and a caller who wants
+	// it different sets it on the preset.
+	switch {
+	case len(customPseudoOrder) > 0:
+		httpReq.Header[http.PHeaderOrderKey] = customPseudoOrder
+	case preset != nil && preset.H2PseudoHeaderOrder() != nil:
+		httpReq.Header[http.PHeaderOrderKey] = preset.H2PseudoHeaderOrder()
+	case protocol == "h3":
+		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":scheme", ":path", ":authority"}
+	default:
+		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
+	}
+	return true
+}
+
+// mergeCallerHeaders folds Request.Headers over whatever the preset pipeline
+// produced. The first value replaces, the rest append, so a caller can both
+// override a preset header and send one name twice.
+//
+// It is a no-op under ExactHeaders. That mode promises the wire carries the
+// listed pairs and nothing else, and req.Headers is not only what the caller
+// passed for this request: the session writes the cookie jar's Cookie header
+// into it on every attempt, and the client-hint policy adds to it as well. So
+// merging here broke the promise in the one place it mattered most, silently
+// appending a jar Cookie to a request built to mirror a capture.
+//
+// It also has to stay out of the way for a structural reason. Exact mode now
+// gives every pair its own slot in the order list and the encoders hand slot i
+// value i, so a Set or an Add here would leave the order list and the value
+// slices it indexes out of step with no error anywhere.
+func mergeCallerHeaders(httpReq *http.Request, req *Request) {
+	if len(req.ExactHeaders) > 0 {
+		return
+	}
+	for key, values := range req.Headers {
+		for i, value := range values {
+			if i == 0 {
+				httpReq.Header.Set(key, value)
+			} else {
+				httpReq.Header.Add(key, value)
+			}
+		}
+	}
+}
+
+func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, customHeaderOrder []string, customPseudoOrder []string, tlsOnly bool, protocol string, userHeaders map[string][]string, stripClientHints bool, exactHeaders []fingerprint.HeaderPair) {
+	if applyExactHeaders(httpReq, exactHeaders, preset, customPseudoOrder, protocol) {
+		return
+	}
 	// In TLS-only mode, skip applying preset headers but still set header order
 	if !tlsOnly {
 		if len(preset.HeaderOrder) > 0 {
@@ -2689,7 +2949,16 @@ func applyPresetHeaders(httpReq *http.Request, preset *fingerprint.Preset, custo
 	// fingerprinting bug — when callers added cache-control/content-type/
 	// cookie, the fork couldn't slot them and appended them after `priority`
 	// instead of placing them where real Chrome does.
-	httpReq.Header[http.HeaderOrderKey] = CompleteHeaderOrder(customHeaderOrder, preset.H2HeaderOrder(), httpReq.Header, userHeaders)
+	//
+	// The order is chosen by request shape. Chrome builds a top-level navigation
+	// and a subresource through different paths and the leading block comes out
+	// differently, so a preset carrying one order gets one of the two wrong. The
+	// dest read here is the final one: the Sec-Fetch inference above has already
+	// run, and the priority table a few lines up reads the same field.
+	httpReq.Header[http.HeaderOrderKey] = CompleteHeaderOrder(
+		customHeaderOrder,
+		preset.H2HeaderOrderFor(httpReq.Header.Get("Sec-Fetch-Dest")),
+		httpReq.Header, userHeaders)
 
 	// Set pseudo-header order: custom (Akamai) > preset H2Config > heuristic
 	if len(customPseudoOrder) > 0 {
@@ -2818,9 +3087,30 @@ func extractHost(urlStr string) string {
 
 // buildHeadersMap converts http.Header to map[string][]string.
 // Preserves all values for multi-value headers (Set-Cookie, etc.)
+// buildTrailerMap is buildHeadersMap for the trailing block, returning nil
+// rather than an empty map so a caller can tell "no trailers" from "trailers
+// that happened to be empty" with a plain nil check.
+func buildTrailerMap(h http.Header) map[string][]string {
+	if len(h) == 0 {
+		return nil
+	}
+	m := buildHeadersMap(h)
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
 func buildHeadersMap(h http.Header) map[string][]string {
 	headers := make(map[string][]string)
 	for key, values := range h {
+		// The order key is transport bookkeeping, not a header the peer sent.
+		// It reaches the response map because the H2 read path records the
+		// arrival order there; it is surfaced separately as Response.HeaderOrder.
+		if key == http.HeaderOrderKey || key == http.PHeaderOrderKey ||
+			key == h1HeaderCasingKey || key == exactHeadersKey {
+			continue
+		}
 		lowerKey := strings.ToLower(key)
 		// Copy values to avoid sharing underlying array
 		headerValues := make([]string, len(values))
@@ -2828,6 +3118,24 @@ func buildHeadersMap(h http.Header) map[string][]string {
 		headers[lowerKey] = headerValues
 	}
 	return headers
+}
+
+// responseHeaderOrder returns the order the peer sent its headers in, or nil
+// when the protocol path did not record one.
+//
+// A map cannot carry order, so a caller relaying a response onward, a MITM
+// addon handing it back to a real browser for instance, otherwise emits a
+// different header sequence than the origin did. HTTP/2 and HTTP/3 decode an
+// ordered field list and can record it for free. HTTP/1.1 reads through
+// textproto, which canonicalises and reorders, so it reports nil for now.
+func responseHeaderOrder(h http.Header) []string {
+	order, ok := h[http.HeaderOrderKey]
+	if !ok || len(order) == 0 {
+		return nil
+	}
+	out := make([]string, len(order))
+	copy(out, order)
+	return out
 }
 
 // readBodyOptimized reads a response body and returns a buffer owned solely by

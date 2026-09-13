@@ -118,6 +118,7 @@ import (
 	"io"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -159,8 +160,19 @@ func encodeResponseBody(b []byte) (string, string) {
 
 // Session handle management
 var (
-	sessionMu      sync.RWMutex
-	sessions       = make(map[int64]*httpcloak.Session)
+	sessionMu sync.RWMutex
+	sessions  = make(map[int64]*httpcloak.Session)
+
+	// lastErrors carries the most recent failure for a session handle.
+	// httpcloak_request_raw returns C.int64_t and signals failure with -1, so
+	// it physically cannot carry an error string; every failure class reached
+	// the caller as the same generic "Request failed". This is where the real
+	// reason goes, retrievable with httpcloak_last_error.
+	//
+	// Guarded by sessionMu and deleted in httpcloak_session_free, so an entry
+	// cannot outlive its session. Nothing is stored for a handle that does not
+	// resolve, which stops a caller passing junk handles from growing the map.
+	lastErrors     = make(map[int64]string)
 	sessionCounter int64
 )
 
@@ -231,11 +243,30 @@ var (
 
 // Request configuration for JSON parsing
 type RequestConfig struct {
-	Method       string            `json:"method"`
-	URL          string            `json:"url"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	Body         string            `json:"body,omitempty"`
-	BodyEncoding string            `json:"body_encoding,omitempty"` // "text" (default) or "base64"
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	// ExactHeaders replaces the whole header pipeline for this request: the
+	// pairs go out in the order and casing given, a name may repeat, and no
+	// preset headers, client hints or alphabetical tail are added.
+	//
+	// It is a list of two-element arrays, [name, value], because the ordinary
+	// Headers map cannot carry order, casing or a repeated name, which is
+	// exactly what reproducing a captured request needs. Headers is ignored
+	// when this is set.
+	ExactHeaders [][]string `json:"exact_headers,omitempty"`
+
+	// HeaderOrder sets the order for this one request and overrides whatever
+	// the session-wide setter installed. Nothing is stored on the session and
+	// no lock is taken, so concurrent requests can each carry their own.
+	//
+	// It is a prefix rather than a replacement: names listed here go first, in
+	// this order, and anything left out keeps the preset's own position. Use it
+	// instead of setting a session-wide order around a request, which races
+	// with every other request in flight.
+	HeaderOrder  []string `json:"header_order,omitempty"`
+	Body         string   `json:"body,omitempty"`
+	BodyEncoding string   `json:"body_encoding,omitempty"` // "text" (default) or "base64"
 	// Timeout's UNIT DEPENDS ON THE ENTRY POINT: httpcloak_request_raw reads it
 	// as MILLISECONDS; httpcloak_request and httpcloak_request_async (and
 	// httpcloak_stream_request) read it as SECONDS. Bindings must convert to
@@ -259,6 +290,12 @@ type RequestConfig struct {
 	// high-entropy hints. Default false leaves the session behaviour intact.
 	DisableClientHints            bool `json:"disable_client_hints,omitempty"`
 	DisableHighEntropyClientHints bool `json:"disable_high_entropy_client_hints,omitempty"`
+
+	// DisableRedirectReferer stops a Referer being added on redirect hops. By
+	// default one is synthesised per Chrome's strict-origin-when-cross-origin
+	// policy, which is what a browser does. When set, no Referer reaches the
+	// next hop at all, including one the caller set on the original request.
+	DisableRedirectReferer bool `json:"disable_redirect_referer,omitempty"`
 }
 
 // Cookie represents a parsed cookie from Set-Cookie header
@@ -291,6 +328,21 @@ type ResponseData struct {
 	Protocol     string              `json:"protocol"`
 	Cookies      []Cookie            `json:"cookies"`
 	History      []RedirectInfo      `json:"history"`
+
+	// The Go core records all three; they were simply never marshalled, so no
+	// binding could reach them however it was written.
+	//
+	// HeaderOrder is the order the peer sent its headers in and HeaderCasing is
+	// how it spelled them. A map carries neither, so anything relaying this
+	// response onward, a proxy or a MITM bridge, otherwise emits a different
+	// header block than the origin did. Both are nil on HTTP/1.1, which reads
+	// through textproto and loses the order and the casing before we see them.
+	//
+	// Trailer is the block that arrives after the body, which is where gRPC puts
+	// its status. Nil when there was none.
+	HeaderOrder  []string            `json:"header_order,omitempty"`
+	HeaderCasing []string            `json:"header_casing,omitempty"`
+	Trailer      map[string][]string `json:"trailer,omitempty"`
 }
 
 // ResponseMetadata for optimized responses - body is passed separately as raw bytes
@@ -302,6 +354,11 @@ type ResponseMetadata struct {
 	Protocol   string              `json:"protocol"`
 	Cookies    []Cookie            `json:"cookies"`
 	History    []RedirectInfo      `json:"history"`
+
+	// See ResponseData for what these are and when they are nil.
+	HeaderOrder  []string            `json:"header_order,omitempty"`
+	HeaderCasing []string            `json:"header_casing,omitempty"`
+	Trailer      map[string][]string `json:"trailer,omitempty"`
 }
 
 // RawResponse holds response data with body as raw bytes (not JSON encoded)
@@ -702,6 +759,9 @@ func makeResponseJSON(resp *httpcloak.Response) *C.char {
 	data := ResponseData{
 		StatusCode:   resp.StatusCode,
 		Headers:      resp.Headers,
+		HeaderOrder:  resp.HeaderOrder,
+		HeaderCasing: resp.HeaderCasing,
+		Trailer:      resp.Trailer,
 		Body:         body,
 		BodyEncoding: bodyEncoding,
 		FinalURL:     resp.FinalURL,
@@ -740,13 +800,16 @@ func makeRawResponse(resp *httpcloak.Response) int64 {
 
 	// Create metadata (without body)
 	meta := ResponseMetadata{
-		StatusCode: resp.StatusCode,
-		Headers:    resp.Headers,
-		BodyLen:    len(bodyBytes),
-		FinalURL:   resp.FinalURL,
-		Protocol:   resp.Protocol,
-		Cookies:    cookies,
-		History:    history,
+		StatusCode:   resp.StatusCode,
+		Headers:      resp.Headers,
+		HeaderOrder:  resp.HeaderOrder,
+		HeaderCasing: resp.HeaderCasing,
+		Trailer:      resp.Trailer,
+		BodyLen:      len(bodyBytes),
+		FinalURL:     resp.FinalURL,
+		Protocol:     resp.Protocol,
+		Cookies:      cookies,
+		History:      history,
 	}
 	metaJSON, _ := json.Marshal(meta)
 
@@ -897,6 +960,7 @@ func httpcloak_response_finalize(handle C.int64_t, dest unsafe.Pointer, destLen 
 //export httpcloak_get_raw
 func httpcloak_get_raw(handle C.int64_t, url *C.char, optionsJSON *C.char) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_get_raw", &hcRet)
+	clearLastError(handle)
 	session := getSession(handle)
 	if session == nil {
 		return -1
@@ -929,19 +993,46 @@ func httpcloak_get_raw(handle C.int64_t, url *C.char, optionsJSON *C.char) (hcRe
 		DisableConditionalCache:       options.DisableConditionalCache,
 		DisableClientHints:            options.DisableClientHints,
 		DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        options.DisableRedirectReferer,
 	}
 
 	resp, err := session.Do(ctx, req)
 	if err != nil {
+		setLastError(handle, "%v", err)
 		return -1
 	}
 
 	return C.int64_t(makeRawResponse(resp))
 }
 
+// httpcloak_last_error returns why the most recent int64-returning call on
+// this session handle failed, or an empty string if it succeeded. The caller
+// owns the returned string and must release it with httpcloak_free_string.
+//
+// It exists because httpcloak_request_raw returns a response handle as an
+// int64 and signals failure with -1. That return type cannot carry a message,
+// so an invalid request JSON, an undecodable body and a genuine network
+// failure were indistinguishable to every binding; they all surfaced as the
+// same generic text. The async path never had this problem because it returns
+// *C.char and can put the error in the payload.
+//
+//export httpcloak_last_error
+func httpcloak_last_error(handle C.int64_t) (hcRet *C.char) {
+	defer guardCharP("httpcloak_last_error", &hcRet)
+	sessionMu.Lock()
+	_, exists := sessions[int64(handle)]
+	msg := lastErrors[int64(handle)]
+	sessionMu.Unlock()
+	if !exists {
+		return C.CString("invalid or closed session handle")
+	}
+	return C.CString(msg)
+}
+
 //export httpcloak_post_raw
 func httpcloak_post_raw(handle C.int64_t, url *C.char, body *C.char, bodyLen C.int, optionsJSON *C.char) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_post_raw", &hcRet)
+	clearLastError(handle)
 	session := getSession(handle)
 	if session == nil {
 		return -1
@@ -984,10 +1075,12 @@ func httpcloak_post_raw(handle C.int64_t, url *C.char, body *C.char, bodyLen C.i
 		DisableConditionalCache:       options.DisableConditionalCache,
 		DisableClientHints:            options.DisableClientHints,
 		DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        options.DisableRedirectReferer,
 	}
 
 	resp, err := session.Do(ctx, req)
 	if err != nil {
+		setLastError(handle, "%v", err)
 		return -1
 	}
 
@@ -997,15 +1090,25 @@ func httpcloak_post_raw(handle C.int64_t, url *C.char, body *C.char, bodyLen C.i
 //export httpcloak_request_raw
 func httpcloak_request_raw(handle C.int64_t, requestJSON *C.char, body *C.char, bodyLen C.int) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_request_raw", &hcRet)
+	clearLastError(handle)
 	session := getSession(handle)
 	if session == nil {
+		// Nowhere to store this one: setLastError refuses unresolvable
+		// handles, and httpcloak_last_error reports the same thing itself.
 		return -1
 	}
 
 	var config RequestConfig
 	if requestJSON != nil {
 		jsonStr := C.GoString(requestJSON)
-		json.Unmarshal([]byte(jsonStr), &config)
+		// The error used to be discarded, which was worse than returning -1:
+		// a malformed request JSON left config at its zero value and went on
+		// to issue a GET to an empty URL, so the caller saw a network-shaped
+		// failure for what was a serialisation bug on their side.
+		if err := json.Unmarshal([]byte(jsonStr), &config); err != nil {
+			setLastError(handle, "request JSON is not valid: %v", err)
+			return -1
+		}
 	}
 
 	var bodyBytes []byte
@@ -1015,7 +1118,9 @@ func httpcloak_request_raw(handle C.int64_t, requestJSON *C.char, body *C.char, 
 		var err error
 		bodyBytes, err = decodeRequestBody(config.Body, config.BodyEncoding)
 		if err != nil {
-			return -1 // Invalid base64
+			setLastError(handle, "request body could not be decoded as %s: %v",
+				config.BodyEncoding, err)
+			return -1
 		}
 	}
 
@@ -1042,15 +1147,19 @@ func httpcloak_request_raw(handle C.int64_t, requestJSON *C.char, body *C.char, 
 		Method:                        method,
 		URL:                           config.URL,
 		Headers:                       buildHeaders(config.Headers, config.FetchMode),
+		ExactHeaders:                  buildExactHeaders(config.ExactHeaders),
+		HeaderOrder:                   config.HeaderOrder,
 		Body:                          bodyReader,
 		FollowRedirects:               config.FollowRedirects,
 		DisableConditionalCache:       config.DisableConditionalCache,
 		DisableClientHints:            config.DisableClientHints,
 		DisableHighEntropyClientHints: config.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        config.DisableRedirectReferer,
 	}
 
 	resp, err := session.Do(ctx, req)
 	if err != nil {
+		setLastError(handle, "%v", err)
 		return -1
 	}
 
@@ -1259,6 +1368,29 @@ func httpcloak_session_new(configJSON *C.char) (hcRet C.int64_t) {
 					fp.PermuteExtensions = b
 				}
 			}
+			// JA3Extras carries seven fields; extra_fp mapped four, so three
+			// were unreachable from every binding. A Firefox mirror needs
+			// record_size_limit, a client offering two key shares needs
+			// key_share_curves, and delegated credentials are extension 34.
+			if v, ok := config.ExtraFP["tls_delegated_credential_algorithms"]; ok {
+				if arr, ok := v.([]interface{}); ok {
+					for _, item := range arr {
+						if s, ok := item.(string); ok {
+							fp.DelegatedCredentialAlgorithms = append(fp.DelegatedCredentialAlgorithms, s)
+						}
+					}
+				}
+			}
+			if v, ok := config.ExtraFP["tls_record_size_limit"]; ok {
+				if n, ok := toUint16(v); ok {
+					fp.RecordSizeLimit = n
+				}
+			}
+			if v, ok := config.ExtraFP["tls_key_share_curves"]; ok {
+				if f, ok := v.(float64); ok {
+					fp.KeyShareCurves = int(f)
+				}
+			}
 		}
 		opts = append(opts, httpcloak.WithCustomFingerprint(fp))
 	}
@@ -1309,6 +1441,7 @@ func httpcloak_session_free(handle C.int64_t) {
 	if exists {
 		delete(sessions, int64(handle))
 	}
+	delete(lastErrors, int64(handle))
 	sessionMu.Unlock()
 
 	if session != nil {
@@ -1365,6 +1498,26 @@ func httpcloak_session_warmup(handle C.int64_t, url *C.char, timeoutMs C.int64_t
 	}
 
 	return nil
+}
+
+// setLastError records why an int64-returning entry point returned -1.
+// Storing nothing for an unresolvable handle is deliberate; see lastErrors.
+func setLastError(handle C.int64_t, format string, args ...interface{}) {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	if _, exists := sessions[int64(handle)]; !exists {
+		return
+	}
+	lastErrors[int64(handle)] = fmt.Sprintf(format, args...)
+}
+
+// clearLastError drops any stored error for a handle. Called at the top of
+// each attempt so a stored message only ever describes the most recent call,
+// rather than a stale failure surviving a later success.
+func clearLastError(handle C.int64_t) {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	delete(lastErrors, int64(handle))
 }
 
 func getSession(handle C.int64_t) *httpcloak.Session {
@@ -1424,6 +1577,12 @@ type RequestOptions struct {
 	// high-entropy hints. Default false leaves the session behaviour intact.
 	DisableClientHints            bool `json:"disable_client_hints,omitempty"`
 	DisableHighEntropyClientHints bool `json:"disable_high_entropy_client_hints,omitempty"`
+
+	// DisableRedirectReferer stops a Referer being added on redirect hops. By
+	// default one is synthesised per Chrome's strict-origin-when-cross-origin
+	// policy, which is what a browser does. When set, no Referer reaches the
+	// next hop at all, including one the caller set on the original request.
+	DisableRedirectReferer bool `json:"disable_redirect_referer,omitempty"`
 	// BodyEncoding controls how the request body string is interpreted by
 	// post_async / get_async style entry points where the body is passed as
 	// a separate C string. "" (default) treats the body as UTF-8 text.
@@ -1472,6 +1631,7 @@ func httpcloak_get(handle C.int64_t, url *C.char, optionsJSON *C.char) (hcRet *C
 		DisableConditionalCache:       options.DisableConditionalCache,
 		DisableClientHints:            options.DisableClientHints,
 		DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        options.DisableRedirectReferer,
 	}
 
 	resp, err := session.Do(ctx, req)
@@ -1538,6 +1698,7 @@ func httpcloak_post(handle C.int64_t, url *C.char, body *C.char, optionsJSON *C.
 		DisableConditionalCache:       options.DisableConditionalCache,
 		DisableClientHints:            options.DisableClientHints,
 		DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        options.DisableRedirectReferer,
 	}
 
 	resp, err := session.Do(ctx, req)
@@ -1592,11 +1753,14 @@ func httpcloak_request(handle C.int64_t, requestJSON *C.char) (hcRet *C.char) {
 		Method:                        config.Method,
 		URL:                           config.URL,
 		Headers:                       buildHeaders(config.Headers, config.FetchMode),
+		ExactHeaders:                  buildExactHeaders(config.ExactHeaders),
+		HeaderOrder:                   config.HeaderOrder,
 		Body:                          bodyReader,
 		FollowRedirects:               config.FollowRedirects,
 		DisableConditionalCache:       config.DisableConditionalCache,
 		DisableClientHints:            config.DisableClientHints,
 		DisableHighEntropyClientHints: config.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        config.DisableRedirectReferer,
 	}
 
 	resp, err := session.Do(ctx, req)
@@ -1726,6 +1890,7 @@ func httpcloak_get_async(handle C.int64_t, url *C.char, optionsJSON *C.char, cal
 			DisableConditionalCache:       options.DisableConditionalCache,
 			DisableClientHints:            options.DisableClientHints,
 			DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+			DisableRedirectReferer:        options.DisableRedirectReferer,
 		}
 
 		resp, err := session.Do(ctx, req)
@@ -1763,6 +1928,9 @@ func httpcloak_get_async(handle C.int64_t, url *C.char, optionsJSON *C.char, cal
 		data := ResponseData{
 			StatusCode:   resp.StatusCode,
 			Headers:      resp.Headers,
+			HeaderOrder:  resp.HeaderOrder,
+			HeaderCasing: resp.HeaderCasing,
+			Trailer:      resp.Trailer,
 			Body:         body,
 			BodyEncoding: bodyEncoding,
 			FinalURL:     resp.FinalURL,
@@ -1843,6 +2011,7 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 			DisableConditionalCache:       options.DisableConditionalCache,
 			DisableClientHints:            options.DisableClientHints,
 			DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+			DisableRedirectReferer:        options.DisableRedirectReferer,
 		}
 
 		resp, err := session.Do(ctx, req)
@@ -1880,6 +2049,9 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 		data := ResponseData{
 			StatusCode:   resp.StatusCode,
 			Headers:      resp.Headers,
+			HeaderOrder:  resp.HeaderOrder,
+			HeaderCasing: resp.HeaderCasing,
+			Trailer:      resp.Trailer,
 			Body:         body,
 			BodyEncoding: bodyEncoding,
 			FinalURL:     resp.FinalURL,
@@ -1944,11 +2116,14 @@ func httpcloak_request_async(handle C.int64_t, requestJSON *C.char, callbackID C
 			Method:                        config.Method,
 			URL:                           config.URL,
 			Headers:                       buildHeaders(config.Headers, config.FetchMode),
+			ExactHeaders:                  buildExactHeaders(config.ExactHeaders),
+			HeaderOrder:                   config.HeaderOrder,
 			Body:                          bodyReader,
 			FollowRedirects:               config.FollowRedirects,
 			DisableConditionalCache:       config.DisableConditionalCache,
 			DisableClientHints:            config.DisableClientHints,
 			DisableHighEntropyClientHints: config.DisableHighEntropyClientHints,
+			DisableRedirectReferer:        config.DisableRedirectReferer,
 		}
 
 		resp, err := session.Do(ctx, req)
@@ -1986,6 +2161,9 @@ func httpcloak_request_async(handle C.int64_t, requestJSON *C.char, callbackID C
 		data := ResponseData{
 			StatusCode:   resp.StatusCode,
 			Headers:      resp.Headers,
+			HeaderOrder:  resp.HeaderOrder,
+			HeaderCasing: resp.HeaderCasing,
+			Trailer:      resp.Trailer,
 			Body:         body,
 			BodyEncoding: bodyEncoding,
 			FinalURL:     resp.FinalURL,
@@ -2521,10 +2699,36 @@ func httpcloak_free_string(str *C.char) {
 	}
 }
 
+// libVersion is the one place the C ABI reports a version from. It has to be
+// bumped with the nine binding version files and the five optionalDependencies
+// pins; it was missed for 1.7.2-beta.2, so every binding reported 1.6.11 off a
+// 1.7.2b2 wheel.
+const libVersion = "1.7.2"
+
+// httpcloak_trim_memory returns freed memory to the operating system and blocks
+// until it has.
+//
+// Freeing a session makes its memory collectable, which is a different thing
+// from giving it back: Go's scavenger releases pages lazily, and on Linux with
+// MADV_FREE they stay counted against the process until the kernel wants them.
+// So RSS stays flat long after the sessions are gone.
+//
+// Deliberately not called by httpcloak_session_free. It stops the world for a
+// full collection, so a caller closing sessions steadily would pay that every
+// time. Call it once between batches instead.
+//
+// Process-wide, not per session.
+//
+//export httpcloak_trim_memory
+func httpcloak_trim_memory() {
+	defer guardVoid("httpcloak_trim_memory")
+	httpcloak.TrimMemory()
+}
+
 //export httpcloak_version
 func httpcloak_version() (hcRet *C.char) {
 	defer guardCharP("httpcloak_version", &hcRet)
-	return C.CString("1.6.11")
+	return C.CString(libVersion)
 }
 
 //export httpcloak_available_presets
@@ -3424,6 +3628,32 @@ type StreamMetadata struct {
 	Protocol      string              `json:"protocol"`
 	ContentLength int64               `json:"content_length"` // -1 if unknown
 	Cookies       []Cookie            `json:"cookies"`
+
+	// The order the peer sent its headers in, nil on HTTP/1.1. Trailers are not
+	// here: on a streamed response they have not arrived yet, so they are read
+	// after the body through httpcloak_stream_trailer.
+	HeaderOrder []string `json:"header_order,omitempty"`
+
+	// StreamHandle is set only by the async entry point, which has to hand the
+	// handle back through the callback because there is no return value to put
+	// it in. The synchronous path returns the handle directly and leaves this
+	// zero, so a caller can tell the two apart.
+	StreamHandle int64 `json:"stream_handle,omitempty"`
+}
+
+// buildStreamMetadata is what stream_get_metadata returns, factored out so the
+// async entry point hands back the same shape rather than a second one that
+// drifts from it.
+func buildStreamMetadata(resp *httpcloak.StreamResponse) StreamMetadata {
+	return StreamMetadata{
+		StatusCode:    resp.StatusCode,
+		Headers:       resp.Headers,
+		HeaderOrder:   resp.HeaderOrder,
+		FinalURL:      resp.FinalURL,
+		Protocol:      resp.Protocol,
+		ContentLength: resp.ContentLength,
+		Cookies:       parseSetCookieHeaders(resp.Headers),
+	}
 }
 
 func getStream(handle int64) *httpcloak.StreamResponse {
@@ -3438,6 +3668,7 @@ func getStream(handle int64) *httpcloak.StreamResponse {
 //export httpcloak_stream_get
 func httpcloak_stream_get(sessionHandle C.int64_t, url *C.char, optionsJSON *C.char) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_stream_get", &hcRet)
+	clearLastError(sessionHandle)
 	session := getSession(sessionHandle)
 	if session == nil {
 		return -1
@@ -3473,6 +3704,7 @@ func httpcloak_stream_get(sessionHandle C.int64_t, url *C.char, optionsJSON *C.c
 		DisableConditionalCache:       options.DisableConditionalCache,
 		DisableClientHints:            options.DisableClientHints,
 		DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        options.DisableRedirectReferer,
 	}
 
 	resp, err := session.DoStream(ctx, req)
@@ -3494,6 +3726,7 @@ func httpcloak_stream_get(sessionHandle C.int64_t, url *C.char, optionsJSON *C.c
 //export httpcloak_stream_post
 func httpcloak_stream_post(sessionHandle C.int64_t, url *C.char, body *C.char, optionsJSON *C.char) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_stream_post", &hcRet)
+	clearLastError(sessionHandle)
 	session := getSession(sessionHandle)
 	if session == nil {
 		return -1
@@ -3537,6 +3770,7 @@ func httpcloak_stream_post(sessionHandle C.int64_t, url *C.char, body *C.char, o
 		DisableConditionalCache:       options.DisableConditionalCache,
 		DisableClientHints:            options.DisableClientHints,
 		DisableHighEntropyClientHints: options.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        options.DisableRedirectReferer,
 	}
 
 	resp, err := session.DoStream(ctx, req)
@@ -3558,6 +3792,7 @@ func httpcloak_stream_post(sessionHandle C.int64_t, url *C.char, body *C.char, o
 //export httpcloak_stream_request
 func httpcloak_stream_request(sessionHandle C.int64_t, requestJSON *C.char) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_stream_request", &hcRet)
+	clearLastError(sessionHandle)
 	session := getSession(sessionHandle)
 	if session == nil {
 		return -1
@@ -3598,11 +3833,14 @@ func httpcloak_stream_request(sessionHandle C.int64_t, requestJSON *C.char) (hcR
 		Method:                        config.Method,
 		URL:                           config.URL,
 		Headers:                       buildHeaders(config.Headers, config.FetchMode),
+		ExactHeaders:                  buildExactHeaders(config.ExactHeaders),
+		HeaderOrder:                   config.HeaderOrder,
 		Body:                          bodyReader,
 		FollowRedirects:               config.FollowRedirects,
 		DisableConditionalCache:       config.DisableConditionalCache,
 		DisableClientHints:            config.DisableClientHints,
 		DisableHighEntropyClientHints: config.DisableHighEntropyClientHints,
+		DisableRedirectReferer:        config.DisableRedirectReferer,
 	}
 
 	resp, err := session.DoStream(ctx, req)
@@ -3621,6 +3859,138 @@ func httpcloak_stream_request(sessionHandle C.int64_t, requestJSON *C.char) (hcR
 	return C.int64_t(handle)
 }
 
+// The async counterpart of httpcloak_stream_request. The synchronous entry
+// point blocks the calling thread until the response headers arrive, which for a
+// stream can be the whole point of the request: a caller opening several long
+// lived streams had to spend a thread on each one while it waited, and a caller
+// on a single-threaded runtime could not open one at all without stalling
+// everything else.
+//
+// The callback receives the same JSON the synchronous path returns through
+// stream_get_metadata, with the stream handle added, so the caller can go
+// straight to stream_read without a second round trip. On failure it receives an
+// error object and no handle.
+//
+// The stream handle it hands back is owned by the caller exactly as the
+// synchronous one is: it stays open, and its context stays uncancelled, until
+// stream_close. Cancelling before the callback fires is done through the
+// callback ID, the same way it is for the other async entry points.
+//
+//export httpcloak_stream_request_async
+func httpcloak_stream_request_async(sessionHandle C.int64_t, requestJSON *C.char, callbackID C.int64_t) {
+	defer guardVoid("httpcloak_stream_request_async")
+	session := getSession(sessionHandle)
+
+	var config RequestConfig
+	if requestJSON != nil {
+		if err := json.Unmarshal([]byte(C.GoString(requestJSON)), &config); err != nil {
+			go func() {
+				errJSON, _ := json.Marshal(ErrorResponse{Error: "invalid request JSON: " + err.Error()})
+				invokeCallback(int64(callbackID), "", string(errJSON))
+			}()
+			return
+		}
+	}
+
+	// Cancellation before the response arrives goes through the callback ID, as
+	// it does for the other async entry points. Once the stream exists its
+	// lifetime belongs to the stream handle, so this cancel is handed over to
+	// the stream entry rather than deferred away.
+	ctx, cancel := context.WithCancel(context.Background())
+	callbackMu.Lock()
+	cancelFuncs[int64(callbackID)] = cancel
+	callbackMu.Unlock()
+
+	go func() {
+		handedOver := false
+		defer func() {
+			if !handedOver {
+				cancel()
+			}
+			callbackMu.Lock()
+			delete(cancelFuncs, int64(callbackID))
+			callbackMu.Unlock()
+		}()
+		defer guardAsync("stream_request_async goroutine", int64(callbackID))
+
+		fail := func(msg string) {
+			errJSON, _ := json.Marshal(ErrorResponse{Error: msg})
+			invokeCallback(int64(callbackID), "", string(errJSON))
+		}
+
+		if session == nil {
+			fail(ErrInvalidSession.Error())
+			return
+		}
+		if config.Method == "" {
+			config.Method = "GET"
+		}
+
+		// Same default as the synchronous path: a stream that never sends is a
+		// leaked goroutine and a held connection, so it gets an outer bound.
+		streamCtx := ctx
+		var timeoutCancel context.CancelFunc
+		if config.Timeout > 0 {
+			streamCtx, timeoutCancel = context.WithTimeout(ctx, time.Duration(config.Timeout)*time.Second)
+		} else {
+			streamCtx, timeoutCancel = context.WithTimeout(ctx, 2*time.Minute)
+		}
+
+		var bodyReader io.Reader
+		if config.Body != "" {
+			bodyBytes, err := decodeRequestBody(config.Body, config.BodyEncoding)
+			if err != nil {
+				timeoutCancel()
+				fail(err.Error())
+				return
+			}
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+
+		req := &httpcloak.Request{
+			Method:                        config.Method,
+			URL:                           config.URL,
+			Headers:                       buildHeaders(config.Headers, config.FetchMode),
+			ExactHeaders:                  buildExactHeaders(config.ExactHeaders),
+			HeaderOrder:                   config.HeaderOrder,
+			Body:                          bodyReader,
+			FollowRedirects:               config.FollowRedirects,
+			DisableConditionalCache:       config.DisableConditionalCache,
+			DisableClientHints:            config.DisableClientHints,
+			DisableHighEntropyClientHints: config.DisableHighEntropyClientHints,
+			DisableRedirectReferer:        config.DisableRedirectReferer,
+		}
+
+		resp, err := session.DoStream(streamCtx, req)
+		if err != nil {
+			timeoutCancel()
+			fail(err.Error())
+			return
+		}
+
+		// The stream owns both cancels from here: the caller closes it, not us.
+		release := func() {
+			timeoutCancel()
+			cancel()
+		}
+		streamMu.Lock()
+		streamCounter++
+		handle := streamCounter
+		streams[handle] = &streamEntry{resp: resp, cancel: release}
+		streamMu.Unlock()
+		handedOver = true
+
+		meta := buildStreamMetadata(resp)
+		meta.StreamHandle = handle
+		metaJSON, err := json.Marshal(meta)
+		if err != nil {
+			fail("encode stream metadata: " + err.Error())
+			return
+		}
+		invokeCallback(int64(callbackID), string(metaJSON), "")
+	}()
+}
+
 //export httpcloak_stream_get_metadata
 func httpcloak_stream_get_metadata(streamHandle C.int64_t) (hcRet *C.char) {
 	defer guardCharP("httpcloak_stream_get_metadata", &hcRet)
@@ -3629,18 +3999,7 @@ func httpcloak_stream_get_metadata(streamHandle C.int64_t) (hcRet *C.char) {
 		return makeErrorJSON(ErrInvalidStream)
 	}
 
-	cookies := parseSetCookieHeaders(stream.Headers)
-
-	metadata := StreamMetadata{
-		StatusCode:    stream.StatusCode,
-		Headers:       stream.Headers,
-		FinalURL:      stream.FinalURL,
-		Protocol:      stream.Protocol,
-		ContentLength: stream.ContentLength,
-		Cookies:       cookies,
-	}
-
-	jsonData, _ := json.Marshal(metadata)
+	jsonData, _ := json.Marshal(buildStreamMetadata(stream))
 	return C.CString(string(jsonData))
 }
 
@@ -3675,6 +4034,35 @@ func httpcloak_stream_read(streamHandle C.int64_t, bufferSize C.int) (hcRet *C.c
 
 	// No data and no error - return empty (shouldn't happen normally)
 	return C.CString("")
+}
+
+// httpcloak_stream_trailer returns the trailing header block as JSON, or "{}"
+// when there was none.
+//
+// Trailers arrive after the body, so unlike a buffered response this cannot be
+// part of the metadata handed over when the stream opens. Call it once the body
+// has been read to EOF; before then it reports what has arrived, which is
+// nothing. gRPC is the case that needs it, since it carries its status there.
+//
+// The returned C string is malloc'd and must be freed with
+// httpcloak_free_string.
+//
+//export httpcloak_stream_trailer
+func httpcloak_stream_trailer(streamHandle C.int64_t) (hcRet *C.char) {
+	defer guardCharP("httpcloak_stream_trailer", &hcRet)
+	stream := getStream(int64(streamHandle))
+	if stream == nil {
+		return C.CString("{}")
+	}
+	trailer := stream.Trailer()
+	if len(trailer) == 0 {
+		return C.CString("{}")
+	}
+	data, err := json.Marshal(trailer)
+	if err != nil {
+		return C.CString("{}")
+	}
+	return C.CString(string(data))
 }
 
 //export httpcloak_stream_read_raw
@@ -3940,6 +4328,9 @@ func httpcloak_upload_finish(uploadHandle C.int64_t) (hcRet *C.char) {
 	responseData := ResponseData{
 		StatusCode:   resp.StatusCode,
 		Headers:      resp.Headers,
+		HeaderOrder:  resp.HeaderOrder,
+		HeaderCasing: resp.HeaderCasing,
+		Trailer:      resp.Trailer,
 		Body:         body,
 		BodyEncoding: bodyEncoding,
 		FinalURL:     resp.FinalURL,
@@ -4246,3 +4637,48 @@ func httpcloak_pool_free(handle C.int64_t) {
 }
 
 func main() {}
+
+// toUint16 accepts the shapes JSON can produce for a 16-bit codepoint: a
+// number, or a string spelled either "0x4001" or "16385". Anything else is
+// rejected rather than coerced, so a malformed value cannot quietly become 0
+// and read as "use the default".
+func toUint16(v interface{}) (uint16, bool) {
+	switch t := v.(type) {
+	case float64:
+		if t < 0 || t > 65535 {
+			return 0, false
+		}
+		return uint16(t), true
+	case string:
+		n, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(t), "0x"), 0, 16)
+		if err != nil {
+			if n2, err2 := strconv.ParseUint(strings.TrimSpace(t), 16, 16); err2 == nil {
+				return uint16(n2), true
+			}
+			return 0, false
+		}
+		return uint16(n), true
+	}
+	return 0, false
+}
+
+// buildExactHeaders converts the [name, value] pairs from a request config.
+// Malformed entries are skipped rather than guessed at: a one-element or
+// three-element array has no sensible reading, and inventing one would put a
+// header on the wire the caller did not ask for.
+func buildExactHeaders(pairs [][]string) []fingerprint.HeaderPair {
+	if len(pairs) == 0 {
+		return nil
+	}
+	out := make([]fingerprint.HeaderPair, 0, len(pairs))
+	for _, p := range pairs {
+		if len(p) != 2 || p[0] == "" {
+			continue
+		}
+		out = append(out, fingerprint.HeaderPair{Key: p[0], Value: p[1]})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

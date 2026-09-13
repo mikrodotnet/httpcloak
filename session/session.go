@@ -102,6 +102,11 @@ type Session struct {
 	// Key log writer for TLS traffic decryption (Wireshark)
 	keyLogWriter io.WriteCloser
 
+	// draining is set by CloseGraceful: the session is inactive but its
+	// transport may still hold connections finishing in-flight responses, so a
+	// later Close must still reach the transport to force them.
+	draining bool
+
 	// refreshed indicates Refresh() was called - adds cache-control: max-age=0 to requests
 	refreshed bool
 
@@ -629,7 +634,16 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 				DisableConditionalCache:       req.DisableConditionalCache,
 				DisableClientHints:            req.DisableClientHints,
 				DisableHighEntropyClientHints: req.DisableHighEntropyClientHints,
+				DisableRedirectReferer:        req.DisableRedirectReferer,
 				OnRedirect:                    req.OnRedirect,
+
+				// ExactHeaders has to survive the hop. Its whole contract is that
+				// nothing else is added, and dropping it here meant a caller
+				// mirroring a captured request got their exact bytes on the first
+				// request and the full preset pipeline on every hop after it,
+				// silently. Referer is the one thing the redirect path may still
+				// add on top, and DisableRedirectReferer turns that off.
+				ExactHeaders: req.ExactHeaders,
 			}
 
 			// Copy safe headers
@@ -659,10 +673,17 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 			// server inspecting the redirect chain can use to fingerprint it.
 			// Drop any copied Referer (either casing) first so we don't emit a
 			// duplicate, then set the policy-correct value.
+			//
+			// DisableRedirectReferer suppresses the synthesis but NOT the two
+			// deletes: a Referer the caller put on the original request names the
+			// pre-redirect URL, and carrying it to the new host would leak exactly
+			// what the caller asked us not to send.
 			delete(newReq.Headers, "Referer")
 			delete(newReq.Headers, "referer")
-			if ref := redirectReferer(req.URL, schemeDowngrade, crossOrigin); ref != "" {
-				newReq.Headers["Referer"] = []string{ref}
+			if !req.DisableRedirectReferer {
+				if ref := redirectReferer(req.URL, schemeDowngrade, crossOrigin); ref != "" {
+					newReq.Headers["Referer"] = []string{ref}
+				}
 			}
 
 			// 307/308 preserve the method and the body. Precedence matches the
@@ -1218,8 +1239,30 @@ func (s *Session) IsActive() bool {
 	return s.active
 }
 
-// Close marks the session as inactive and closes connections
+// Close marks the session as inactive and closes connections immediately,
+// including any left draining by an earlier CloseGraceful.
 func (s *Session) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.active && !s.draining {
+		return
+	}
+	s.active = false
+	s.draining = false
+
+	if s.transport != nil {
+		s.transport.Close()
+	}
+	s.closeKeyLog()
+}
+
+// CloseGraceful marks the session as inactive and closes its connections
+// without interrupting requests that are in flight: idle connections close
+// now, and a connection with a response body still streaming closes when the
+// body finishes. It returns immediately. Close may be called afterwards to
+// force whatever is still draining.
+func (s *Session) CloseGraceful() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1227,12 +1270,17 @@ func (s *Session) Close() {
 		return
 	}
 	s.active = false
+	s.draining = true
 
 	if s.transport != nil {
-		s.transport.Close()
+		s.transport.CloseGraceful()
 	}
+	// No handshake happens after this point, so nothing more is logged.
+	s.closeKeyLog()
+}
 
-	// Close key log writer if we opened one
+// closeKeyLog closes the key log writer if we opened one. Caller holds s.mu.
+func (s *Session) closeKeyLog() {
 	if s.keyLogWriter != nil {
 		s.keyLogWriter.Close()
 		s.keyLogWriter = nil

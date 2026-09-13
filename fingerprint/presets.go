@@ -2,6 +2,7 @@ package fingerprint
 
 import (
 	"runtime"
+	"time"
 
 	tls "github.com/sardanioss/utls"
 )
@@ -85,8 +86,39 @@ type Preset struct {
 	H2Config             *H2FingerprintConfig // nil = Chrome defaults for all H2 fingerprinting
 	H3Config             *H3FingerprintConfig // nil = Chrome defaults for all H3/QUIC fingerprinting
 	JA3                  string               // JA3 fingerprint string. When set, parsed fresh per connection instead of using ClientHelloID.
+	PSKJA3               string               // JA3 captured from a resuming connection (extension list contains 41). Empty = no JA3-mode resumption.
 	JA3Extras            *JA3Extras           // Supplements JA3 parsing. nil = Chrome defaults.
-	BasedOn              string               // For custom presets: name of the parent preset (used by inheritance-loop detection). Empty for built-ins.
+
+	// RawClientHello holds the DECODED bytes of a captured TLS ClientHello
+	// record, not a parsed spec. That is deliberate: uTLS ApplyPreset mutates
+	// a ClientHelloSpec (it clears KeyShares.Data among other things), so a
+	// spec cached on the preset would be corrupt after the first handshake.
+	// The spec is re-derived per connection, exactly as the JA3 path does.
+	//
+	// RawPSKClientHello is the same client captured mid-resumption, carrying a
+	// pre_shared_key extension. RawBluntMimicry passes unknown extensions
+	// through verbatim (curl needs it for extension 22).
+	RawClientHello    []byte
+	RawPSKClientHello []byte
+	RawBluntMimicry   bool
+
+	// RawPermuteExtensions shuffles a captured hello's extension order per
+	// connection, the way Chromium does.
+	//
+	// It has to be declared rather than detected. A capture is one connection,
+	// so its extension order is one sample: nothing in the bytes says whether
+	// the client that produced them would have ordered them differently next
+	// time. Chromium permutes, and everything built on NSS, Apple's stack or Go
+	// does not, so mirroring a captured Chrome without this freezes an order
+	// that the real client varies on every handshake, and turning it on for a
+	// captured curl invents variation the real client never has.
+	//
+	// Ignored when RawBluntMimicry is set. Blunt mimicry exists to pass through
+	// extensions this library has no model for, and moving something it cannot
+	// parse risks placing it where the protocol does not allow, so the two are
+	// mutually exclusive by design rather than by accident.
+	RawPermuteExtensions bool
+	BasedOn           string // For custom presets: name of the parent preset (used by inheritance-loop detection). Empty for built-ins.
 
 	// SignatureAlgorithms, when non-empty, replaces the signature_algorithms
 	// extension emitted on TCP (HTTP/1.1 + HTTP/2), on top of whatever base spec
@@ -105,6 +137,19 @@ type Preset struct {
 	// certificate chains impractical), and adds rsa_pkcs1_sha1 there instead.
 	// Empty = leave the QUIC base ClientHelloID untouched.
 	QUICSignatureAlgorithms []tls.SignatureScheme
+
+	// TrustAnchors are the identifiers carried in the trust_anchors extension
+	// (0xCA34, draft-ietf-tls-trust-anchor-ids), which Chrome ships from
+	// version 152. Each entry is an encoded relative object identifier.
+	//
+	// They live in the preset rather than in code because the list is a
+	// snapshot of a Chrome root store and moves independently of the browser
+	// version, so refreshing it should not need a release. Empty means the
+	// extension is not sent at all, which is every preset before Chrome 152.
+	//
+	// The ORDER here is canonical only. Chrome shuffles the list per
+	// connection, and so does the extension.
+	TrustAnchors [][]byte
 }
 
 // SpecFor generates the uTLS ClientHelloSpec for id at the given shuffle seed and
@@ -114,11 +159,19 @@ type Preset struct {
 // A drop-in replacement for tls.UTLSIdToSpecWithSeed so every transport spec path
 // (H2/H3, fresh and PSK) can share one override point.
 func SpecFor(id tls.ClientHelloID, seed int64, sigAlgs []tls.SignatureScheme) (*tls.ClientHelloSpec, error) {
+	return SpecForWithAnchors(id, seed, sigAlgs, nil)
+}
+
+// SpecForWithAnchors is SpecFor plus the trust_anchors list, which is an
+// insertion rather than an override and so cannot go through the same
+// slice-mutating helper.
+func SpecForWithAnchors(id tls.ClientHelloID, seed int64, sigAlgs []tls.SignatureScheme, anchors [][]byte) (*tls.ClientHelloSpec, error) {
 	spec, err := tls.UTLSIdToSpecWithSeed(id, seed)
 	if err != nil {
 		return nil, err
 	}
 	ApplySignatureAlgorithms(spec.Extensions, sigAlgs)
+	ApplyTrustAnchors(&spec.Extensions, anchors)
 	return &spec, nil
 }
 
@@ -136,6 +189,50 @@ func ApplySignatureAlgorithms(exts []tls.TLSExtension, algs []tls.SignatureSchem
 			return
 		}
 	}
+}
+
+// ApplyTrustAnchors puts the trust_anchors extension (0xCA34) into a spec,
+// carrying anchors, and is a no-op when anchors is empty.
+//
+// It replaces an existing one rather than adding a second, so a spec that
+// already carries the extension (a captured hello, say) takes the preset's
+// list. Otherwise it inserts ahead of the trailing run of extensions that may
+// not move: GREASE brackets the list, padding sizes the record, and RFC 8446
+// 4.2.11 requires pre_shared_key to be last. Landing after those would pin the
+// extension to the final slot, where BoringSSL marks it out_compressible and so
+// takes part in the ordinary permutation like any other.
+// It takes a pointer to the slice, unlike ApplySignatureAlgorithms, because
+// adding an extension changes the slice header rather than an element. That
+// also lets the H1 path pass &tlsConn.Extensions, where there is no spec.
+func ApplyTrustAnchors(exts *[]tls.TLSExtension, anchors [][]byte) {
+	if exts == nil || len(anchors) == 0 {
+		return
+	}
+	ext := &tls.TrustAnchorsExtension{
+		TrustAnchors: append([][]byte(nil), anchors...),
+		Shuffle:      true,
+	}
+	for i, e := range *exts {
+		if _, ok := e.(*tls.TrustAnchorsExtension); ok {
+			(*exts)[i] = ext
+			return
+		}
+	}
+
+	at := len(*exts)
+	for at > 0 {
+		switch (*exts)[at-1].(type) {
+		case *tls.UtlsGREASEExtension, *tls.UtlsPaddingExtension, tls.PreSharedKeyExtension:
+			at--
+			continue
+		}
+		break
+	}
+	out := make([]tls.TLSExtension, 0, len(*exts)+1)
+	out = append(out, (*exts)[:at]...)
+	out = append(out, ext)
+	out = append(out, (*exts)[at:]...)
+	*exts = out
 }
 
 // TCPFingerprint contains TCP/IP stack parameters that identify the OS.
@@ -198,12 +295,65 @@ type HTTP2Settings struct {
 // also fall back to Chrome defaults, so you can override just the fields you need.
 type H2FingerprintConfig struct {
 	HPACKHeaderOrder    []string // HPACK wire encoding order. nil = Chrome 143 default.
+
+	// HPACKHeaderOrderSubresource is the order for every request that is not a
+	// top-level navigation. Chrome builds those through a different path and the
+	// leading block comes out differently: platform hint and user-agent first,
+	// then the rest of the hint cluster. Nil means "use HPACKHeaderOrder for
+	// everything", which is what every non-Chromium preset wants.
+	HPACKHeaderOrderSubresource []string `json:"hpack_header_order_subresource,omitempty"`
 	HPACKIndexingPolicy string   // "chrome"/"never"/"always"/"default". "" = "chrome".
-	HPACKNeverIndex     []string // Headers never HPACK-indexed. nil = Chrome default.
-	StreamPriorityMode  string   // "chrome"/"default". "" = "chrome".
-	DisableCookieSplit  *bool    // nil = true (single field). Chrome+Firefox crumble (false); Safari single (true).
-	SettingsOrder       []uint16 // H2 SETTINGS frame ID order. nil = dynamic from HTTP2Settings.
-	PseudoHeaderOrder   []string // Pseudo-header order. nil = heuristic (Chrome m,a,s,p / Safari m,s,p,a).
+	// DataFrameMaxSize caps the payload of a DATA frame this profile will send.
+	// nil means derive it from the client family; see H2DataFrameMaxSize.
+	DataFrameMaxSize *uint32
+
+	// HPACKRepresentation pins the HPACK representation of individual header
+	// names: "incremental", "without", "never", or "default". It is an OVERRIDE
+	// LAYER, expected to be empty for a browser profile whose base policy is
+	// already correct, and to carry only the names where a mirrored client
+	// demonstrably differs.
+	//
+	// A curl mirror needs {"authorization": "never"} and nothing else. It does
+	// NOT need a ":path" entry: the Chrome policy already emits a literal
+	// without indexing for every pseudo-header except :authority, which is what
+	// curl does too.
+	//
+	// Deriving this map means diffing a captured client's representations
+	// against what the chosen base policy would produce and recording only the
+	// deltas. Filling it from raw observation makes every preset restate its
+	// own policy and drift the moment that policy improves.
+	HPACKRepresentation map[string]string
+
+	HPACKNeverIndex    []string // Headers never HPACK-indexed. nil = Chrome default.
+	StreamPriorityMode string   // "chrome"/"default". "" = "chrome".
+
+	// PrefacePingIdleMs is how long a connection's peer must have been silent
+	// before a request on that connection carries a PING alongside it.
+	//
+	// Chromium calls this a preface ping and sets the threshold with
+	// kSpdyDefaultConnectionAtRiskOfLossSeconds, which is 10 seconds. nil and 0
+	// both mean "send none". The default is deliberately off rather than
+	// Chrome's 10 seconds: a nil-means-10s default would switch the ping on for
+	// every preset that does not name the key, including mirror profiles of
+	// clients that send no such ping, which is louder than sending nothing.
+	// The Chrome presets set it explicitly in chromeH2Config.
+	PrefacePingIdleMs *uint32
+
+	// PrefacePingHangMs is how long to tolerate silence from the peer while a
+	// preface ping is outstanding before closing the connection. nil falls back
+	// to PrefacePingIdleMs, matching Chromium, where both intervals are 10
+	// seconds. Ignored when PrefacePingIdleMs is 0.
+	PrefacePingHangMs *uint32
+
+	// IdlePingMs enables the periodic health-check PING, which is a Go
+	// construct with no browser counterpart: it is a PING with no frame behind
+	// it, on a timer, and Chromium's only pings are attached to a frame it is
+	// about to send. nil and 0 mean off, which is what every shipped preset
+	// wants.
+	IdlePingMs         *uint32
+	DisableCookieSplit *bool    // nil = true (single field). Chrome+Firefox crumble (false); Safari single (true).
+	SettingsOrder      []uint16 // H2 SETTINGS frame ID order. nil = dynamic from HTTP2Settings.
+	PseudoHeaderOrder  []string // Pseudo-header order. nil = heuristic (Chrome m,a,s,p / Safari m,s,p,a).
 
 	// PriorityTable maps sec-fetch-dest values to RFC 7540 stream priorities and
 	// the matching RFC 9218 priority: header value. Populated for browsers (e.g.
@@ -369,6 +519,24 @@ type H3FingerprintConfig struct {
 	MaxResponseHeaderBytes    *uint64 // nil = 262144
 	SendGreaseFrames          *bool   // nil = true
 
+	// QUICConnectionOptions are the four-character QUIC tags carried in
+	// google_connection_options (0x3128), concatenated in the order given.
+	//
+	// nil means Chrome's unmodified default, ["ORIG"]. An explicitly empty
+	// list omits the parameter, which is what a non-Chromium profile wants.
+	//
+	// The parameter is sent only for Chromium QUIC identities; a Firefox or
+	// WebKit preset carries no google_connection_options at all whatever this
+	// says, which is why describe emits the key only when it is set.
+	//
+	// The value is not fixed by Chrome version. Chromium builds it from
+	// features::kQuicOptions, a Finch parameter parsed under kTryQuicByDefault
+	// whose shipped default is "ORIG", so a browser that has picked up a
+	// different seed emits something else: captures of one Chrome 152 install
+	// show both ["ORIG"] and ["IW50","ORIG"]. Hence a key rather than a
+	// constant.
+	QUICConnectionOptions *[]string
+
 	// QUIC flow-control windows. quic-go translates these to wire transport
 	// parameters initial_max_data (4) and initial_max_stream_data_* (5/6/7).
 	// nil = quic-go default (~7.5 MB conn, ~512 KB stream). Safari/iOS Chrome
@@ -428,6 +596,75 @@ func (p *Preset) H2HPACKIndexingPolicy() string {
 // ~880-byte header block against Chrome's ~35.
 //
 // Set H2Config.HPACKNeverIndex explicitly to opt in for a non-browser profile.
+// H2DataFrameMaxSize is the largest DATA frame payload this profile will send,
+// or 0 for no cap beyond whatever the peer advertised.
+//
+// Chromium uses 16384 minus the 9-byte frame header, deliberately, so that the
+// header and the payload land inside exactly one 16KB TLS record. Writing the
+// full 16384 instead makes every DATA frame 16393 bytes on the wire, which the
+// record layer splits into a 16401-byte record followed by a 26-byte one. That
+// little tail repeats on every frame forever and no browser produces it.
+//
+// Chromium also IGNORES the peer's SETTINGS_MAX_FRAME_SIZE for this: the chunk
+// size is a compile-time constant. A server that advertises 1 MiB and receives
+// one enormous DATA frame has learned something in a single request.
+//
+// Firefox and the WebKit family do NOT do this; they use the full 16384. So the
+// value is derived from the client family rather than applied everywhere, or
+// fixing Chrome's tell would hand Chrome's DATA sizing to every Firefox and
+// Safari profile and create a new one.
+//
+// Derived from ClientHelloID rather than the preset name so a renamed preset
+// still gets the right answer. A JA3-only or captured-hello profile has no
+// ClientHelloID and gets 0, which is correct: a mirror of some other client
+// should not inherit Chrome's framing. Such a profile can set it explicitly.
+func (p *Preset) H2DataFrameMaxSize() uint32 {
+	if p.H2Config != nil && p.H2Config.DataFrameMaxSize != nil {
+		return *p.H2Config.DataFrameMaxSize
+	}
+	if p.ClientHelloID.Client == "Chrome" {
+		return 16375
+	}
+	return 0
+}
+
+// H2HPACKRepresentation returns the per-name representation overrides, or nil
+// when the preset relies entirely on its base policy, which every shipped
+// browser profile does.
+// H2PrefacePingIdle is how long the peer must have been silent before a
+// request on that connection carries a PING alongside it. Zero means none.
+func (p *Preset) H2PrefacePingIdle() time.Duration {
+	if p.H2Config != nil && p.H2Config.PrefacePingIdleMs != nil {
+		return time.Duration(*p.H2Config.PrefacePingIdleMs) * time.Millisecond
+	}
+	return 0
+}
+
+// H2PrefacePingHang is how long to tolerate silence while a preface ping is
+// outstanding. Falls back to the idle threshold, as Chromium does.
+func (p *Preset) H2PrefacePingHang() time.Duration {
+	if p.H2Config != nil && p.H2Config.PrefacePingHangMs != nil {
+		return time.Duration(*p.H2Config.PrefacePingHangMs) * time.Millisecond
+	}
+	return p.H2PrefacePingIdle()
+}
+
+// H2IdlePing is the interval of the periodic health-check PING. Zero, for every
+// shipped preset, because no browser sends one.
+func (p *Preset) H2IdlePing() time.Duration {
+	if p.H2Config != nil && p.H2Config.IdlePingMs != nil {
+		return time.Duration(*p.H2Config.IdlePingMs) * time.Millisecond
+	}
+	return 0
+}
+
+func (p *Preset) H2HPACKRepresentation() map[string]string {
+	if p.H2Config != nil && len(p.H2Config.HPACKRepresentation) > 0 {
+		return p.H2Config.HPACKRepresentation
+	}
+	return nil
+}
+
 func (p *Preset) H2HPACKNeverIndex() []string {
 	if p.H2Config != nil && p.H2Config.HPACKNeverIndex != nil {
 		return p.H2Config.HPACKNeverIndex
@@ -466,6 +703,23 @@ func (p *Preset) H2SettingsOrder() []uint16 {
 
 // H2PseudoHeaderOrder returns the pseudo-header order for HTTP/2.
 // nil signals "use heuristic" (Chrome m,a,s,p / Safari m,s,p,a).
+// H2HeaderOrderFor returns the wire header order for a request with the given
+// sec-fetch-dest.
+//
+// Chrome emits a different order for a top-level navigation than for everything
+// the page then fetches, so a preset carrying one order gets one of the two
+// wrong. An empty dest means the caller could not tell, and is treated as a
+// navigation because that is the shape a bare Get() has.
+func (p *Preset) H2HeaderOrderFor(dest string) []string {
+	if dest == "" || dest == "document" || dest == "iframe" {
+		return p.H2HeaderOrder()
+	}
+	if p.H2Config != nil && len(p.H2Config.HPACKHeaderOrderSubresource) > 0 {
+		return p.H2Config.HPACKHeaderOrderSubresource
+	}
+	return p.H2HeaderOrder()
+}
+
 func (p *Preset) H2PseudoHeaderOrder() []string {
 	if p.H2Config != nil && p.H2Config.PseudoHeaderOrder != nil {
 		return p.H2Config.PseudoHeaderOrder
@@ -660,6 +914,17 @@ func (p *Preset) H3QUICMaxDatagramFrameSize() uint64 {
 	return 65536 // Chrome default
 }
 
+// H3QUICConnectionOptions returns the QUIC tags for google_connection_options
+// (0x3128). Each tag is four characters and they are sent concatenated.
+//
+// nil is Chrome's shipped default of one tag, "ORIG".
+func (p *Preset) H3QUICConnectionOptions() []string {
+	if p.H3Config != nil && p.H3Config.QUICConnectionOptions != nil {
+		return *p.H3Config.QUICConnectionOptions
+	}
+	return []string{"ORIG"}
+}
+
 // H3MaxResponseHeaderBytes returns the max response header bytes.
 func (p *Preset) H3MaxResponseHeaderBytes() uint64 {
 	if p.H3Config != nil && p.H3Config.MaxResponseHeaderBytes != nil {
@@ -723,6 +988,41 @@ func chromeH2Config() *H2FingerprintConfig {
 			"accept-encoding", "accept-language",
 			"cookie", "priority",
 		},
+		// Everything that is not a top-level navigation. Captured from Chrome 152
+		// on Windows across 20 requests covering script, style, image, font,
+		// manifest and empty: all six produce this one order, so the split is
+		// navigation-vs-not rather than per resource type.
+		//
+		// The difference from the navigation order above is confined to the head:
+		// sec-ch-ua-platform and user-agent lead, then the rest of the hint
+		// cluster. upgrade-insecure-requests and sec-fetch-user do not appear on a
+		// subresource at all, and referer does.
+		//
+		// Three slots come from single observations. origin was seen on a CORS
+		// font fetch and pragma/cache-control on a no-store fetch(), all three at
+		// the very front; sec-fetch-storage-access was seen on a cross-origin
+		// script, between sec-fetch-dest and referer. Their order relative to each
+		// other when several appear at once was not observed.
+		//
+		// The high-entropy hints were not in the capture, since the origins tested
+		// do not request them. They are placed next to their low-entropy siblings,
+		// which is inference rather than measurement; the navigation order emits
+		// the cluster alphabetically and this one plainly does not, so if a capture
+		// ever shows them, expect this grouping to be the part that is wrong.
+		HPACKHeaderOrderSubresource: []string{
+			"pragma", "cache-control", "origin",
+			"sec-ch-ua-platform", "sec-ch-ua-platform-version",
+			"user-agent",
+			"sec-ch-ua", "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version-list",
+			"sec-ch-ua-mobile", "sec-ch-ua-model", "sec-ch-ua-wow64",
+			"content-type", "content-length",
+			"accept",
+			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-storage-access",
+			"referer",
+			"if-none-match", "if-modified-since",
+			"accept-encoding", "accept-language",
+			"cookie", "priority",
+		},
 		HPACKIndexingPolicy: "chrome",
 		StreamPriorityMode:  "chrome",
 		// Chrome crumbles the Cookie header into one field per cookie-pair on the
@@ -732,8 +1032,19 @@ func chromeH2Config() *H2FingerprintConfig {
 		DisableCookieSplit: &f,
 		SettingsOrder:      []uint16{1, 2, 4, 6},
 		PseudoHeaderOrder:  []string{":method", ":authority", ":scheme", ":path"},
+		// kSpdyDefaultConnectionAtRiskOfLossSeconds and kHungIntervalSeconds,
+		// both 10 seconds in Chromium. Set here rather than defaulted from the
+		// client family so that a mirror profile, an example JSON preset or a
+		// user preset that does not name the key sends nothing.
+		PrefacePingIdleMs: &chromePrefacePingIdleMs,
+		PrefacePingHangMs: &chromePrefacePingHangMs,
 	}
 }
+
+var (
+	chromePrefacePingIdleMs = uint32(10000)
+	chromePrefacePingHangMs = uint32(10000)
+)
 
 // firefoxH2Config returns the explicit H2 fingerprint config for Firefox presets.
 func firefoxH2Config() *H2FingerprintConfig {
@@ -2429,13 +2740,11 @@ func AndroidChrome151() *Preset {
 // sends no client hints at all - which means the User-Agent is the only thing
 // that changes between iOS versions.
 //
-// PROVISIONAL: iOS Chrome spells its version out in full (CriOS/150.0.7871.51
-// for 150) rather than using the reduced desktop form, and that build number
-// cannot be derived from the major version. The value here is a placeholder
-// pending a real iOS 151 capture. Because of that, "chrome-latest-ios"
-// deliberately still resolves to IOSChrome150, so nobody gets an unverified
-// fingerprint without asking for it by name. Once a capture lands, correct the
-// user_agent in fingerprint/embedded/chrome-151-ios.json and repoint the alias.
+// CAPTURED. The User-Agent was a placeholder until a real CriOS/151 capture
+// landed; it is now the measured value, CriOS/151.0.7922.112 on iOS 26_6_0.
+// The invented one had guessed 151.0.7990.44 on 26_5_0, wrong in both parts,
+// which is why the iOS line does not invent build numbers any more.
+// "chrome-latest-ios" resolves here now rather than to IOSChrome150.
 //
 // Falls back to IOSChrome150.
 func IOSChrome151() *Preset {
@@ -2443,6 +2752,130 @@ func IOSChrome151() *Preset {
 		return p
 	}
 	return IOSChrome150()
+}
+
+// Chrome152Windows returns Chrome 152 on Windows.
+//
+// The first Chrome release since 146 to change the ClientHello rather than just
+// the headers. Two wire changes, both confirmed against BoringSSL source and
+// four captures across two hosts and both transports.
+//
+// trust_anchors (0xCA34, draft-ietf-tls-trust-anchor-ids) carries 32 identifiers
+// across three issuer arcs. The list is a snapshot of the Chrome root store, so
+// it lives in the preset JSON and can be refreshed without a release. Every
+// capture carried the same SET in a different ORDER, so the extension shuffles
+// per connection.
+//
+// A GREASE signature algorithm leads signature_algorithms on TCP, because that
+// is what Chrome 152 shipped. From the 152.0.7977.64 release tag,
+// net/base/features.cc:965:
+//
+//	BASE_FEATURE(kTlsGreaseSigalgs, base::FEATURE_ENABLED_BY_DEFAULT);
+//
+// with features.h describing it as "a killswitch for behavior that is enabled by
+// default", so the flag exists to switch the behaviour OFF remotely rather than
+// to roll it out gradually. ssl_client_socket_impl.cc:211 calls
+// SSL_CTX_set_grease_sigalgs_enabled behind it, and BoringSSL's
+// ext_sigalgs_add_clienthello writes the GREASE value before
+// tls12_add_verify_sigalgs. Both captures this preset was built from carried one.
+//
+// v1.7.0-beta.3 shipped without it, reasoning that a JA4 implementation which
+// fails to strip GREASE from the sigalg list would read one profile as many
+// clients. It does: twenty connections to such a scorer gave twelve distinct
+// JA4_c, a clean 1:1 map from GREASE value to hash. The reasoning was still
+// wrong, because that churn is what every Chrome 152 produces, so it is the
+// population rather than an anomaly, and a profile with one stable JA4 was the
+// only thing on the wire not behaving like Chrome.
+//
+// The error underneath was checking main instead of the release branch. When the
+// question is what a Chrome version actually shipped, ask the tag:
+//
+//	chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows
+//	chromium.googlesource.com/chromium/src/+/refs/tags/<version>/<path>?format=TEXT
+//
+// The second returns the file base64-encoded, as shipped.
+//
+// If the killswitch is ever pushed, drop 2570 from the head of
+// signature_algorithms; TestChrome152SigalgGreaseCanBeTurnedOff locks that the
+// override still works. QUIC never greases sigalgs and needs no override either
+// way, because the nine algorithms it advertises already match the base.
+//
+// Two header values move, and as with 151 the second is not what a naive bump
+// would give, because the greased brand list reseeds off the major version:
+//
+//	150: "Not;A=Brand";v="8",  "Chromium";v="150",      "Google Chrome";v="150"
+//	151: "Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"
+//	152: "Chromium";v="152",   "Not?A_Brand";v="24",    "Google Chrome";v="152"
+//
+// Falls back to Chrome151Windows if the JSON didn't load.
+func Chrome152Windows() *Preset {
+	if p := LookupCustom("chrome-152-windows"); p != nil {
+		return p
+	}
+	return Chrome151Windows()
+}
+
+// Chrome152Linux returns Chrome 152 on Linux. See Chrome152Windows.
+func Chrome152Linux() *Preset {
+	if p := LookupCustom("chrome-152-linux"); p != nil {
+		return p
+	}
+	return Chrome151Linux()
+}
+
+// Chrome152macOS returns Chrome 152 on macOS. See Chrome152Windows.
+func Chrome152macOS() *Preset {
+	if p := LookupCustom("chrome-152-macos"); p != nil {
+		return p
+	}
+	return Chrome151macOS()
+}
+
+// Chrome152 returns the Chrome 152 fingerprint preset auto-detected from the
+// running OS.
+func Chrome152() *Preset {
+	switch GetPlatformInfo().Platform {
+	case "Windows":
+		return Chrome152Windows()
+	case "macOS":
+		return Chrome152macOS()
+	default:
+		return Chrome152Linux()
+	}
+}
+
+// AndroidChrome152 returns Chrome 152 on Android. Carries both wire changes:
+// the Chrome root store ships in the browser binary and is the same list on
+// every platform, and the signature-algorithm GREASE is BoringSSL behaviour
+// rather than anything platform-specific. The captures behind them were taken
+// on Windows. Android uses the reduced UA, so there is no build number to
+// track. Falls back to AndroidChrome151.
+func AndroidChrome152() *Preset {
+	if p := LookupCustom("chrome-152-android"); p != nil {
+		return p
+	}
+	return AndroidChrome151()
+}
+
+// IOSChrome152 returns Chrome 152 on iOS. WebKit underneath, so NEITHER of the
+// two Chrome 152 wire changes applies: no trust_anchors, no signature-algorithm
+// GREASE, and no client hints at all. The User-Agent is the only thing that
+// moves between versions.
+//
+// CAPTURED. Two CriOS/152 captures agree with the two CriOS/151 ones on every
+// fingerprint: same ja3_hash ecdf4f49dd59effc439639da29186671, same ja4
+// t13d2013h2_a09f3c656075_7f0f34a4126d, same peetprint, same Akamai hash, same
+// extension order and the same eight headers. Only the User-Agent moves, which
+// is what WebKit underneath predicts.
+//
+// The build number is measured, never derived. 151 was 151.0.7922.112 and 152
+// is 152.0.7977.64, so even the patch component fell rather than rose; an
+// earlier placeholder had guessed 152.0.8080.60.
+func IOSChrome152() *Preset {
+	if p := LookupCustom("chrome-152-ios"); p != nil {
+		return p
+	}
+	return IOSChrome151()
 }
 
 // IOSChrome143 returns Chrome 143 on iOS fingerprint preset
@@ -3029,6 +3462,12 @@ var presets = map[string]func() *Preset{
 	"chrome-150-macos":    Chrome150macOS,
 	"chrome-150-ios":      IOSChrome150,
 	"chrome-150-android":  AndroidChrome150,
+	"chrome-152":          Chrome152,
+	"chrome-152-windows":  Chrome152Windows,
+	"chrome-152-linux":    Chrome152Linux,
+	"chrome-152-macos":    Chrome152macOS,
+	"chrome-152-ios":      IOSChrome152,
+	"chrome-152-android":  AndroidChrome152,
 	"chrome-151":          Chrome151,
 	"chrome-151-windows":  Chrome151Windows,
 	"chrome-151-linux":    Chrome151Linux,
@@ -3041,18 +3480,18 @@ var presets = map[string]func() *Preset{
 	// build number that cannot be derived from the major version, so
 	// chrome-151-ios is provisional until a real capture confirms it (see
 	// IOSChrome151).
-	"chrome-latest":          Chrome151,
-	"chrome-latest-windows":  Chrome151Windows,
-	"chrome-latest-linux":    Chrome151Linux,
-	"chrome-latest-macos":    Chrome151macOS,
+	"chrome-latest":          Chrome152,
+	"chrome-latest-windows":  Chrome152Windows,
+	"chrome-latest-linux":    Chrome152Linux,
+	"chrome-latest-macos":    Chrome152macOS,
 	"firefox-latest":         Firefox148,
 	"firefox-latest-windows": Firefox148Windows,
 	"firefox-latest-linux":   Firefox148Linux,
 	"firefox-latest-macos":   Firefox148macOS,
 	"safari-latest":          Safari18,
-	"chrome-latest-ios":      IOSChrome150,
+	"chrome-latest-ios":      IOSChrome152,
 	"safari-latest-ios":      IOSSafari18,
-	"chrome-latest-android":  AndroidChrome151,
+	"chrome-latest-android":  AndroidChrome152,
 
 	// Backwards compatibility aliases (old naming convention)
 	"ios-chrome-143":        IOSChrome143,
