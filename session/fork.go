@@ -59,7 +59,7 @@ func (s *Session) forkOne() *Session {
 		transportConfig = &cfgCopy
 	} else {
 		needsConfig := len(cfgCopy.ConnectTo) > 0 || cfgCopy.ECHConfigDomain != "" ||
-			cfgCopy.TLSOnly || cfgCopy.QuicIdleTimeout > 0 || cfgCopy.LocalAddress != "" ||
+			cfgCopy.TLSOnly || cfgCopy.QuicIdleTimeout > 0 || cfgCopy.HTTP2MaxConnAge != 0 || cfgCopy.LocalAddress != "" ||
 			cfgCopy.EnableSpeculativeTLS
 		if needsConfig {
 			transportConfig = &transport.TransportConfig{
@@ -67,6 +67,7 @@ func (s *Session) forkOne() *Session {
 				ECHConfigDomain:      cfgCopy.ECHConfigDomain,
 				TLSOnly:              cfgCopy.TLSOnly,
 				QuicIdleTimeout:      time.Duration(cfgCopy.QuicIdleTimeout) * time.Second,
+				HTTP2MaxConnAge:      time.Duration(cfgCopy.HTTP2MaxConnAge) * time.Second,
 				LocalAddr:            cfgCopy.LocalAddress,
 				EnableSpeculativeTLS: cfgCopy.EnableSpeculativeTLS,
 			}
@@ -94,7 +95,9 @@ func (s *Session) forkOne() *Session {
 	} else if cfgCopy.ForceHTTP3 {
 		t.SetProtocol(transport.ProtocolHTTP3)
 	} else if cfgCopy.DisableHTTP3 {
-		t.SetProtocol(transport.ProtocolHTTP2)
+		// Auto mode without HTTP/3, not forced HTTP/2: forcing HTTP/2 lost
+		// the fallback to HTTP/1.1 for servers that only offer that (#121).
+		t.SetDisableHTTP3(true)
 	}
 
 	if cfgCopy.PreferIPv4 {

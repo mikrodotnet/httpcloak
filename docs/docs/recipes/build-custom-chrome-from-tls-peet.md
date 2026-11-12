@@ -127,16 +127,16 @@ print(f"wrote {len(j)} bytes")
 </TabItem>
 </Tabs>
 
-`Describe` returns the whole preset fully resolved, with no inheritance and no defaults to track down later. The output looks roughly like this:
+`Describe` returns the whole preset fully resolved, with no inheritance and no defaults to track down later. The output looks roughly like this. The walkthrough was put together when `chrome-latest` meant Chrome 148, so that's what the samples on this page show; run it today and you'll get `chrome-158-linux` (on a Linux host) with 158's values instead, and the steps are the same.
 
 ```json
 {
   "version": 1,
   "preset": {
-    "name": "chrome-152-linux",
+    "name": "chrome-148-linux",
     "tls": {
-      "client_hello": "chrome-152-linux",
-      "psk_client_hello": "chrome-152-linux-psk",
+      "client_hello": "chrome-146-linux",
+      "psk_client_hello": "chrome-146-linux-psk",
       "quic_client_hello": "chrome-146-quic",
       "quic_psk_client_hello": "chrome-146-quic-psk"
     },
@@ -353,7 +353,7 @@ Don't use JA3 hash equality as a CI pass criterion. It will flake. Use JA4 inste
 
 - **TLS extension order changes.** When a new Chrome major adds an extension or reshuffles the order, JSON edits cannot reach into the ClientHello. The fix is a utls profile bump.
 - **HTTP/2 frame ordering.** The shipped presets cover the common Chrome shapes. A frame shape the shipped preset does not have is worth an issue, not a JSON workaround.
-- **HTTP/3.** Same constraint as the TLS layer. The shipped `quic_client_hello` profiles define the QUIC handshake bytes; JSON only edits headers.
+- **HTTP/3 from a profile.** The shipped `quic_client_hello` profiles define their QUIC handshake bytes and JSON cannot edit them. To match a QUIC hello exactly, capture it and set `raw_quic_client_hello` instead (see [Captured ClientHello mode](../reference/json-preset-spec#captured-clienthello-mode)).
 
 The path for any of those is a utls and sardanioss/net update, not a custom JSON preset.
 

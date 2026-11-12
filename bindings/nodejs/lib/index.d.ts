@@ -207,6 +207,13 @@ export class StreamResponse {
   /** Parse the response body as JSON */
   json<T = any>(): T;
 
+  /**
+   * Trailer fields sent after the body (gRPC puts its status here). Call it
+   * once the body has been read to the end; before that it lists the names
+   * announced in the Trailer header, each with no values.
+   */
+  trailer(): Record<string, string[]>;
+
   /** Close the stream and release resources */
   close(): void;
 
@@ -215,7 +222,7 @@ export class StreamResponse {
 }
 
 export interface SessionOptions {
-  /** Browser preset to use (default: "chrome-146") */
+  /** Browser preset to use (default: "chrome-latest") */
   preset?: string;
   /** Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port") */
   proxy?: string;
@@ -253,6 +260,8 @@ export interface SessionOptions {
   tlsOnly?: boolean;
   /** QUIC idle timeout in seconds (default: 30). Set higher for long-lived HTTP/3 connections. */
   quicIdleTimeout?: number;
+  /** Seconds after which an HTTP/2 connection takes no new requests and a fresh one is opened (default: five minutes). 0 turns the limit off. Requests already on it still finish. */
+  http2MaxConnAge?: number;
   /** Local IP address to bind outgoing connections (for IPv6 rotation with IP_FREEBIND on Linux) */
   localAddress?: string;
   /** Path to write TLS key log for Wireshark decryption (overrides SSLKEYLOGFILE env var) */
@@ -356,9 +365,9 @@ export interface RequestOptions {
   disableHighEntropyClientHints?: boolean;
 
   /**
-   * Per-request opt-out of the Referer httpcloak adds when it follows a
-   * redirect. When true no Referer is synthesised for the next hop; a Referer
-   * the caller set themselves still goes out.
+   * Per-request opt-out of the Referer a redirect hop carries, which is the
+   * first request's own Referer re-applied for the hop's URL. When true no
+   * Referer goes out on any hop, including one the caller set.
    */
   disableRedirectReferer?: boolean;
 
@@ -936,7 +945,7 @@ export class Session {
 export interface LocalProxyOptions {
   /** Port to listen on (default: 0 for auto-assign) */
   port?: number;
-  /** Browser preset to use (default: "chrome-146") */
+  /** Browser preset to use (default: "chrome-latest") */
   preset?: string;
   /** Request timeout in seconds (default: 30) */
   timeout?: number;
@@ -948,6 +957,8 @@ export interface LocalProxyOptions {
   udpProxy?: string;
   /** TLS-only mode: skip preset HTTP headers, only apply TLS fingerprint (default: false) */
   tlsOnly?: boolean;
+  /** Verify the certificates of the sites the proxy connects to (default: true). false is for testing. */
+  verify?: boolean;
 }
 
 export interface LocalProxyStats {
@@ -1175,24 +1186,75 @@ export function request(method: string, url: string, options?: RequestOptions): 
 
 /** Available browser presets */
 export const Preset: {
+  // Chrome latest (auto-resolves to newest shipped Chrome)
   CHROME_LATEST: string;
   CHROME_LATEST_WINDOWS: string;
   CHROME_LATEST_LINUX: string;
   CHROME_LATEST_MACOS: string;
   CHROME_LATEST_IOS: string;
   CHROME_LATEST_ANDROID: string;
+
+  // Chrome 153 (headers-only over 152; no iOS preset until one is captured)
+  CHROME_153: string;
+  CHROME_153_WINDOWS: string;
+  CHROME_153_LINUX: string;
+  CHROME_153_MACOS: string;
+  CHROME_153_ANDROID: string;
+  // Chrome 154 (headers-only over 153)
+  CHROME_154: string;
+  CHROME_154_WINDOWS: string;
+  CHROME_154_LINUX: string;
+  CHROME_154_MACOS: string;
+  CHROME_154_ANDROID: string;
+  // Chrome 155 (desktop and Android add image/jxl to Accept; TLS unchanged; iOS captured)
+  CHROME_155: string;
+  CHROME_155_WINDOWS: string;
+  CHROME_155_LINUX: string;
+  CHROME_155_MACOS: string;
+  CHROME_155_IOS: string;
+  CHROME_155_ANDROID: string;
+  // Chrome 156 (headers only over 155)
+  CHROME_156: string;
+  CHROME_156_WINDOWS: string;
+  CHROME_156_LINUX: string;
+  CHROME_156_MACOS: string;
+  CHROME_156_ANDROID: string;
+  // Chrome 157 (headers only over 156)
+  CHROME_157: string;
+  CHROME_157_WINDOWS: string;
+  CHROME_157_LINUX: string;
+  CHROME_157_MACOS: string;
+  CHROME_157_ANDROID: string;
+  // Chrome 158 (headers only over 157)
+  CHROME_158: string;
+  CHROME_158_WINDOWS: string;
+  CHROME_158_LINUX: string;
+  CHROME_158_MACOS: string;
+  CHROME_158_ANDROID: string;
+
+  // Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
+  CHROME_152: string;
+  CHROME_152_WINDOWS: string;
+  CHROME_152_LINUX: string;
+  CHROME_152_MACOS: string;
+  CHROME_152_ANDROID: string;
+  CHROME_152_IOS: string;
+
+  // Chrome 151 (headers only over 150)
   CHROME_151: string;
   CHROME_151_WINDOWS: string;
   CHROME_151_LINUX: string;
   CHROME_151_MACOS: string;
   CHROME_151_ANDROID: string;
   CHROME_151_IOS: string;
+
   CHROME_150: string;
   CHROME_150_WINDOWS: string;
   CHROME_150_LINUX: string;
   CHROME_150_MACOS: string;
   CHROME_150_ANDROID: string;
   CHROME_150_IOS: string;
+
   FIREFOX_148_WINDOWS: string;
   FIREFOX_148_LINUX: string;
   FIREFOX_148_MACOS: string;
@@ -1202,63 +1264,97 @@ export const Preset: {
   FIREFOX_LATEST_WINDOWS: string;
   FIREFOX_LATEST_LINUX: string;
   FIREFOX_LATEST_MACOS: string;
+
   CHROME_149: string;
   CHROME_149_WINDOWS: string;
   CHROME_149_LINUX: string;
   CHROME_149_MACOS: string;
+
+  // Chrome 148
   CHROME_148: string;
   CHROME_148_WINDOWS: string;
   CHROME_148_LINUX: string;
   CHROME_148_MACOS: string;
   CHROME_148_IOS: string;
   CHROME_148_ANDROID: string;
+
+  // Chrome 147
   CHROME_147: string;
   CHROME_147_WINDOWS: string;
   CHROME_147_LINUX: string;
   CHROME_147_MACOS: string;
   CHROME_147_IOS: string;
   CHROME_147_ANDROID: string;
+
+  // Chrome 146
   CHROME_146: string;
   CHROME_146_WINDOWS: string;
   CHROME_146_LINUX: string;
   CHROME_146_MACOS: string;
+  CHROME_146_IOS: string;
+  CHROME_146_ANDROID: string;
+
+  // Chrome 145
   CHROME_145: string;
   CHROME_145_WINDOWS: string;
   CHROME_145_LINUX: string;
   CHROME_145_MACOS: string;
+  CHROME_145_IOS: string;
+  CHROME_145_ANDROID: string;
+
+  // Chrome 144
   CHROME_144: string;
   CHROME_144_WINDOWS: string;
   CHROME_144_LINUX: string;
   CHROME_144_MACOS: string;
+  CHROME_144_IOS: string;
+  CHROME_144_ANDROID: string;
+
+  // Chrome 143
   CHROME_143: string;
   CHROME_143_WINDOWS: string;
   CHROME_143_LINUX: string;
   CHROME_143_MACOS: string;
+  CHROME_143_IOS: string;
+  CHROME_143_ANDROID: string;
+
+  // Older Chrome (H1/H2 only, no H3)
   CHROME_141: string;
   CHROME_133: string;
-  CHROME_143_IOS: string;
-  CHROME_144_IOS: string;
-  CHROME_145_IOS: string;
-  CHROME_146_IOS: string;
-  CHROME_143_ANDROID: string;
-  CHROME_144_ANDROID: string;
-  CHROME_145_ANDROID: string;
-  CHROME_146_ANDROID: string;
+
+  // Firefox
+  FIREFOX_LATEST: string;
+  FIREFOX_148: string;
   FIREFOX_133: string;
+
+  // Safari (desktop and mobile)
+  SAFARI_LATEST: string;
   SAFARI_18: string;
   SAFARI_17_IOS: string;
   SAFARI_18_IOS: string;
-  // Backwards compatibility aliases
+  SAFARI_26_IOS: string;
+  SAFARI_LATEST_IOS: string;
+
+  // Backwards compatibility aliases (old "ios-chrome" / "android-chrome" naming)
   IOS_CHROME_143: string;
   IOS_CHROME_144: string;
   IOS_CHROME_145: string;
   IOS_CHROME_146: string;
+  IOS_CHROME_147: string;
+  IOS_CHROME_148: string;
+  IOS_CHROME_LATEST: string;
   ANDROID_CHROME_143: string;
   ANDROID_CHROME_144: string;
   ANDROID_CHROME_145: string;
   ANDROID_CHROME_146: string;
+  ANDROID_CHROME_147: string;
+  ANDROID_CHROME_148: string;
+  ANDROID_CHROME_LATEST: string;
   IOS_SAFARI_17: string;
   IOS_SAFARI_18: string;
+  IOS_SAFARI_26: string;
+  IOS_SAFARI_LATEST: string;
+
   all(): string[];
 };
 
@@ -1374,6 +1470,14 @@ export class SessionCacheBackend {
  * Configure a distributed session cache backend.
  *
  * Supports both synchronous and asynchronous callbacks (auto-detected).
+ *
+ * The callbacks run on the JavaScript thread, so use the async request methods
+ * on sessions created while a cache is configured. On those sessions the
+ * methods that block that thread (the *Sync, stream and fast-path methods,
+ * uploadStream and warmup) would wait on a callback that cannot run until they
+ * return, so they throw an HTTPCloakError instead. A session keeps the cache it
+ * was created with, so clearSessionCache() lifts this only for sessions
+ * created after it.
  *
  * @param options Cache configuration
  * @returns The registered SessionCacheBackend instance

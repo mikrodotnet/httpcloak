@@ -5,7 +5,7 @@
 //
 // Basic usage:
 //
-//	client := httpcloak.New("chrome-146")
+//	client := httpcloak.New("chrome-latest")
 //	defer client.Close()
 //
 //	resp, err := client.Get(ctx, "https://example.com")
@@ -16,7 +16,7 @@
 //
 // With options:
 //
-//	client := httpcloak.New("chrome-146",
+//	client := httpcloak.New("chrome-latest",
 //	    httpcloak.WithTimeout(30*time.Second),
 //	    httpcloak.WithProxy("http://user:pass@proxy:8080"),
 //	)
@@ -87,12 +87,12 @@ func WithProxy(proxyURL string) Option {
 
 // New creates a new HTTP client with the specified browser fingerprint.
 //
-// Available presets:
+// An empty name gives "chrome-latest". Available presets include:
 //   - "chrome-latest" (recommended), "chrome-latest-windows", "chrome-latest-linux", "chrome-latest-macos"
-//   - "chrome-146", "chrome-145", "chrome-144", "chrome-143", "chrome-141", "chrome-133"
+//   - "chrome-155" down to "chrome-143", then "chrome-141" and "chrome-133"
 //   - "firefox-latest", "firefox-133"
 //   - "safari-latest", "safari-18"
-//   - "chrome-latest-ios", "safari-latest-ios"
+//   - "chrome-latest-ios", "safari-latest-ios", "safari-26-ios"
 //   - "chrome-latest-android"
 //
 // The -latest aliases always resolve to the newest version in the library.
@@ -613,6 +613,8 @@ type sessionConfig struct {
 	echConfigDomain               string            // Domain to fetch ECH config from
 	tlsOnly                       bool              // TLS-only mode: skip preset headers, set all manually
 	quicIdleTimeout               time.Duration     // QUIC idle timeout (default: 30s)
+	http2MaxConnAge               time.Duration     // HTTP/2 connection age limit; see WithHTTP2MaxConnAge
+	http2MaxConnAgeSet            bool              // WithHTTP2MaxConnAge was given
 	localAddr                     string            // Local IP address to bind outgoing connections
 	keyLogFile                    string            // Path to write TLS key log for Wireshark decryption
 	disableECH                    bool              // Disable ECH lookup for faster first request
@@ -973,6 +975,33 @@ func WithQuicIdleTimeout(d time.Duration) SessionOption {
 	}
 }
 
+// WithHTTP2MaxConnAge sets how old a Session's HTTP/2 connection may get
+// before new requests go out on a fresh one. The default is five minutes.
+// A positive d sets the limit, rounded up to whole seconds; zero or less
+// turns it off, so a connection is reused for as long as the server keeps it
+// open, as Chrome does. Responses already in flight on an old connection
+// still finish, and idle timeouts, a server's GOAWAY and closing the session
+// still apply. This option does not configure Client, HTTP/1.1 or HTTP/3.
+func WithHTTP2MaxConnAge(d time.Duration) SessionOption {
+	return func(c *sessionConfig) {
+		c.http2MaxConnAge = d
+		c.http2MaxConnAgeSet = true
+	}
+}
+
+// http2MaxConnAgeSeconds turns the option into SessionConfig's form: 0 for
+// the default, whole seconds rounded up for a limit, -1 for none.
+func (c *sessionConfig) http2MaxConnAgeSeconds() int {
+	switch {
+	case !c.http2MaxConnAgeSet:
+		return 0
+	case c.http2MaxConnAge <= 0:
+		return -1
+	default:
+		return int((c.http2MaxConnAge + time.Second - 1) / time.Second)
+	}
+}
+
 // WithSessionCache sets a distributed TLS session cache backend.
 // This enables TLS session ticket sharing across multiple instances (e.g., via Redis).
 // The errorCallback is optional and will be called when backend operations fail.
@@ -1115,6 +1144,7 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 		ECHConfigDomain:               cfg.echConfigDomain,
 		TLSOnly:                       cfg.tlsOnly,
 		QuicIdleTimeout:               int(cfg.quicIdleTimeout.Seconds()),
+		HTTP2MaxConnAge:               cfg.http2MaxConnAgeSeconds(),
 		LocalAddress:                  cfg.localAddr,
 		KeyLogFile:                    cfg.keyLogFile,
 		DisableECH:                    cfg.disableECH,
@@ -1210,15 +1240,15 @@ func toResponse(resp *transport.Response) *Response {
 	}
 
 	return &Response{
-		StatusCode:  resp.StatusCode,
-		Headers:     resp.Headers,
-		HeaderOrder: resp.HeaderOrder,
-		Trailer:     resp.Trailer,
+		StatusCode:   resp.StatusCode,
+		Headers:      resp.Headers,
+		HeaderOrder:  resp.HeaderOrder,
+		Trailer:      resp.Trailer,
 		HeaderCasing: resp.HeaderCasing,
-		Body:        resp.Body,
-		FinalURL:    resp.FinalURL,
-		Protocol:    resp.Protocol,
-		History:     history,
+		Body:         resp.Body,
+		FinalURL:     resp.FinalURL,
+		Protocol:     resp.Protocol,
+		History:      history,
 	}
 }
 

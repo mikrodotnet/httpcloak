@@ -2,12 +2,11 @@ package client
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"fmt"
-	"io"
 	http "github.com/sardanioss/http"
+	"github.com/sardanioss/httpcloak/internal/respheader"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -15,6 +14,8 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"github.com/sardanioss/httpcloak/fingerprint"
+	"github.com/sardanioss/httpcloak/internal/compress"
+	"github.com/sardanioss/httpcloak/internal/gunzip"
 	"github.com/sardanioss/httpcloak/protocol"
 )
 
@@ -103,7 +104,7 @@ func processResponse(resp *http.Response, originalURL string, startTime time.Tim
 	}
 
 	// Decompress if needed
-	contentEncoding := resp.Header.Get("Content-Encoding")
+	contentEncoding := respheader.ContentEncoding(resp.Header)
 	body, err = Decompress(body, contentEncoding)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress response: %w", err)
@@ -135,12 +136,7 @@ func processResponse(resp *http.Response, originalURL string, startTime time.Tim
 func Decompress(data []byte, encoding string) ([]byte, error) {
 	switch strings.ToLower(encoding) {
 	case "gzip":
-		reader, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		defer reader.Close()
-		return io.ReadAll(reader)
+		return gunzip.Bytes(data)
 
 	case "br":
 		reader := brotli.NewReader(bytes.NewReader(data))
@@ -155,9 +151,8 @@ func Decompress(data []byte, encoding string) ([]byte, error) {
 		return io.ReadAll(decoder)
 
 	case "deflate":
-		reader := flate.NewReader(bytes.NewReader(data))
-		defer reader.Close()
-		return io.ReadAll(reader)
+		// zlib-framed (RFC 9110) or raw, decided the way Chrome decides.
+		return compress.InflateDeflate(data)
 
 	case "", "identity":
 		return data, nil

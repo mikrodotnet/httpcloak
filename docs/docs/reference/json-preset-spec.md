@@ -93,10 +93,10 @@ The TLS layer. Two configuration modes that don't mix: a named uTLS ClientHello 
 
 ```json
 "tls": {
-  "client_hello":      "chrome-152-windows",       // mutually exclusive with ja3
-  "psk_client_hello":  "chrome-152-windows-psk",
-  "quic_client_hello": "chrome-148-quic",
-  "quic_psk_client_hello": "chrome-148-quic-psk",
+  "client_hello":      "chrome-146-windows",       // mutually exclusive with ja3
+  "psk_client_hello":  "chrome-146-windows-psk",
+  "quic_client_hello": "chrome-146-quic",
+  "quic_psk_client_hello": "chrome-146-quic-psk",
 
   "ja3":        "771,4865-...,0-23-...,29-23-24,0",
   "ja3_extras": { ... },
@@ -113,7 +113,7 @@ The TLS layer. Two configuration modes that don't mix: a named uTLS ClientHello 
 
 | Field | Type | Notes |
 |---|---|---|
-| `client_hello` | string | uTLS ClientHello ID name (e.g. `"chrome-152-windows"`). Mutually exclusive with `ja3`. |
+| `client_hello` | string | uTLS ClientHello ID name (e.g. `"chrome-146-windows"`; the Chrome presets from 146 to 158 all build on the per-OS `chrome-146-*` IDs). Mutually exclusive with `ja3`. |
 | `psk_client_hello` | string | PSK variant for TLS session resumption. Requires `client_hello` (directly or via `based_on`). |
 | `quic_client_hello` | string | QUIC-specific ClientHello. Cannot be used with `ja3`. |
 | `quic_psk_client_hello` | string | QUIC PSK variant. |
@@ -137,6 +137,8 @@ over the bytes of a real one.
 "tls": {
   "raw_client_hello":     "FgMBAgA...",
   "raw_psk_client_hello": "FgMBAiA...",
+  "raw_quic_client_hello":     "FgMBAfA...",
+  "raw_quic_psk_client_hello": "FgMBAhA...",
   "allow_blunt_mimicry":  true,
   "permute_raw_hello":    true
 }
@@ -146,8 +148,15 @@ over the bytes of a real one.
 |---|---|---|
 | `raw_client_hello` | string | Base64 of a captured ClientHello, starting at the TLS record header. Everything it contains goes on the wire as captured. |
 | `raw_psk_client_hello` | string | The same client's resumption-shaped hello. Without it a resuming session sends a first-handshake shape with a ticket bolted on, which that client never sends. |
-| `allow_blunt_mimicry` | bool | Passes through extensions this library has no model for. Without it an unmodelled extension is a load-time error, which is how a captured curl hello fails. |
-| `permute_raw_hello` | bool | Shuffles the extension order per connection. |
+| `raw_quic_client_hello` | string | The same kind of capture taken from a QUIC handshake, used for HTTP/3. It must carry `quic_transport_parameters`, which every QUIC hello has and no TCP one does. It replaces the inherited `quic_client_hello` and `quic_psk_client_hello`. |
+| `raw_quic_psk_client_hello` | string | The QUIC capture's resumption-shaped hello. Without it HTTP/3 does not resume. |
+| `allow_blunt_mimicry` | bool | Passes through extensions this library has no model for. Without it an unmodelled extension is a load-time error, which is how a captured curl hello fails. Applies to both captures. |
+| `permute_raw_hello` | bool | Shuffles the extension order per connection. Applies to both captures. |
+
+`raw_client_hello` decides TCP and `raw_quic_client_hello` decides QUIC, so one
+preset can replay a client on HTTP/1.1, HTTP/2 and HTTP/3 at once. Either can also
+stand alone next to a `client_hello`. A QUIC capture in `raw_client_hello` still
+works on HTTP/3 when `raw_quic_client_hello` is not set.
 
 `permute_raw_hello` has to be declared because it cannot be detected. A capture is
 one connection, so its extension order is a single sample, and nothing in the
@@ -171,10 +180,25 @@ rather than a handshake failure on the first request.
 ```
 
 Hex-encoded certificate authority identifiers for the trust anchors extension
-(`0xCA34`), 1 to 255 bytes each. Chrome 152 advertises 28 of them. The order is
-reshuffled per connection, because the browser's own order is not stable: it comes
-from iterating a hash container that is reseeded whenever the configuration is
-copied, which happens once per connection.
+(`0xCA34`), 1 to 255 bytes each. Chrome 152 advertises 28 of them. The list goes
+out in exactly the order you write it on TCP, and on QUIC too unless
+`quic_trust_anchors_shuffle` says otherwise. Which order is right depends on the
+version: Chrome 152 and 153 send a fixed but meaningless order (the iteration order
+of a hash set), while 154 and newer sort the identifiers first. Inherited through
+`based_on` unless set.
+
+### `quic_trust_anchors_shuffle`
+
+```json
+"tls": { "quic_trust_anchors_shuffle": true }
+```
+
+When true, the `trust_anchors` list is reshuffled on every QUIC connection while
+the TCP list stays fixed. That's what Chrome 152 and 153 do, so the 152 presets set
+it and 153 inherits it. From 154 Chrome sorts the list and sends it unchanged on both transports, so
+the 154 presets set it back to `false`. Inherited through `based_on` unless set;
+the extension's position in the ClientHello is a separate thing and is permuted
+with the other extensions on every version.
 
 ### `psk_ja3`
 
@@ -206,7 +230,12 @@ The build step rejects the following combinations:
 - `ja3_extras` without `ja3`.
 - Any of `psk_client_hello`, `quic_client_hello`, `quic_psk_client_hello` when there's no primary `client_hello` or `ja3` to anchor them.
 - `quic_client_hello` / `quic_psk_client_hello` / `psk_client_hello` paired with `ja3` (JA3 doesn't control QUIC TLS, use `client_hello` mode for QUIC).
-- TLS extension fields (`signature_algorithms`, `alpn`, `cert_compression`, `permute_extensions`, `record_size_limit`) when `client_hello` is set without `ja3` (those fields only apply to JA3).
+- `raw_quic_client_hello` on a preset that uses `ja3`, set here or inherited. Pair it with `raw_client_hello` or `client_hello` instead.
+- `raw_quic_client_hello` with `quic_client_hello` or `quic_psk_client_hello` in the same spec.
+- `raw_psk_client_hello` without `raw_client_hello`, and `raw_quic_psk_client_hello` without `raw_quic_client_hello`.
+- A `raw_quic_client_hello` or `raw_quic_psk_client_hello` with no `quic_transport_parameters` extension. That is a TCP capture and belongs in `raw_client_hello`. A `quic_transport_parameters` body that does not decode as a parameter list is refused too.
+- `alpn`, `cert_compression`, `record_size_limit` or `permute_extensions` in a `tls` block without `ja3`, whether the hello comes from `client_hello`, from `based_on`, or from a `raw_client_hello` or `raw_quic_client_hello` (which fix them already; `permute_extensions` is allowed there). They are only read alongside `ja3`, so the build refuses them instead of dropping them. `signature_algorithms` is the exception: on the `client_hello` path it overrides the extension on top of the inherited hello.
+- Any top-level TLS extension field (`signature_algorithms`, `delegated_credential_algorithms`, `alpn`, `cert_compression`, `permute_extensions`, `record_size_limit`, `key_share_curves`) next to a `ja3_extras` block. `ja3_extras` replaces them, so put them inside it.
 
 ---
 
@@ -319,10 +348,12 @@ resource type.
 | `preface_ping_idle_ms` | uint32 | When a connection has been idle this long, the next request on it carries a PING alongside. Omitted or `0` sends none. Chrome uses `10000`. |
 | `preface_ping_hang_ms` | uint32 | The companion hang interval. |
 | `idle_ping_ms` | uint32 | Enables a periodic health-check PING, which no browser sends. Omitted or `0` means off, which is what a browser profile wants. |
+| `priority_model` | string | `"chromium"` or `"table"`. On `chromium` a request's own `priority` header picks its weight and each new stream chains onto the newest open stream at the same or a higher priority, as Chrome does. On `table` the weight always comes from the table and every stream's parent is 0, as in Firefox. Omitted derives it from `stream_exclusive`. See [Per-Resource Priority](../fingerprinting/per-resource-priority). |
+| `priority_over_http1` | bool | Whether the priority header also goes out over HTTP/1.1. Firefox sends it there; Chrome, on every platform, does not. Omitted derives it from the model, and `describe` always writes it out. |
 
 ### `priority_table`
 
-Maps `sec-fetch-dest` values (`document`, `image`, `script`, `style`, `font`, and so on) to per-resource priority settings. When populated, the transport emits a per-request RFC 7540 stream weight derived from `urgency` plus an RFC 9218 `priority:` header on every request, keyed off the request's `sec-fetch-dest`.
+Maps `sec-fetch-dest` values (`document`, `image`, `script`, `style`, `font`, and so on) to per-resource priority settings. When populated, the transport emits a per-request RFC 7540 stream weight, from `weight` when the entry sets one and derived from `urgency` otherwise, plus an RFC 9218 `priority:` header on every request, keyed off the request's `sec-fetch-dest`.
 
 ```json
 "priority_table": {
@@ -337,6 +368,7 @@ Maps `sec-fetch-dest` values (`document`, `image`, `script`, `style`, `font`, an
 | `urgency` | uint8 | 0 (highest) to 7 (lowest). Maps to RFC 9218. |
 | `incremental` | bool | Whether the resource can be processed incrementally. |
 | `emit_header` | bool | When true, the transport emits a `priority:` header on the request. |
+| `weight` | uint16 | 1 to 256. The RFC 7540 weight for this resource type. Omitted derives it from `urgency` the way Chrome does; Firefox's weights are not a function of the urgency, so its table sets them. |
 
 Omit it and every request uses the preset's static `stream_weight` and `stream_exclusive`. That's the legacy single-weight behaviour from before the priority table existed.
 
@@ -407,6 +439,12 @@ because the value comes from a server-side experiment and can change without a
 Chrome release. An explicitly empty list sends none; omitting the field entirely
 falls back to the default.
 
+When HTTP/3 uses a captured hello (`raw_quic_client_hello`, or a QUIC capture in
+`raw_client_hello`), the capture decides whether `version_information` and the
+connection options are sent at all: each goes out only if the captured
+`quic_transport_parameters` carries it. Omitting this field then sends the
+captured tags rather than `["ORIG"]`.
+
 ## `headers` object
 
 The HTTP request header bundle. User-Agent, all the named values, and the exact wire order they're sent in.
@@ -432,6 +470,7 @@ The HTTP request header bundle. User-Agent, all the named values, and the exact 
 | `user_agent` | string | The `User-Agent` value. Set separately because the field is also referenced in `order` via `"key": "user-agent"`. |
 | `values` | object (string→string) | Header values keyed by lowercase header name. Merged with the inherited `values` from `based_on`. |
 | `order` | array of `{key, value}` | The exact header order on the wire. Lowercase keys. An empty `value` means "use the value from `values` or `user_agent`". |
+| `image_accept` | string | The `Accept` header for image loads. Navigation carries its `Accept` in `order`, but image requests are built elsewhere and need their own value. Optional and inherited through `based_on`; empty means the pre-155 value, `image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8`. The Chrome 155 to 158 presets set `image/jxl,image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8`. |
 
 Order matters. HTTP/2 and HTTP/3 don't enforce header order on the receiving side, but bot-detection products fingerprint it. Real Chrome and real Firefox sit far apart on this dimension.
 

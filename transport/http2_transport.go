@@ -19,6 +19,7 @@ import (
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/internal/h2build"
+	"github.com/sardanioss/httpcloak/internal/respheader"
 	"github.com/sardanioss/httpcloak/proxy"
 	"github.com/sardanioss/net/http2"
 	tls "github.com/sardanioss/utls"
@@ -54,9 +55,17 @@ type HTTP2Transport struct {
 	// TLS session resumption cache (shared across connections)
 	sessionCache utls.ClientSessionCache
 
-	// Shuffle seed for consistent TLS extension order across all connections
-	// Chrome shuffles extensions once per session, not per connection
-	// Each connection needs a fresh spec (ApplyPreset mutates it), but same seed
+	// Seed passed to the spec builder. It does NOT pin the extension order, and
+	// must not be made to: Chrome redraws the permutation on every handshake,
+	// because BoringSSL keeps extension_permutation on SSL_HANDSHAKE rather than
+	// on SSL_CTX. Measured on 153.0.8010.52, one browser session opening 7
+	// parallel connections produced 7 different orders.
+	//
+	// It is inert here. The TCP parrot literals already shuffle with fresh
+	// randomness when the spec is built, and the seeded shuffle runs on top of
+	// that, so the result is fresh per connection whatever the seed is. The QUIC
+	// parrots had no such inline shuffle, which is why the same seed DID pin
+	// their order until it was removed. See fingerprint.FreshShuffleSeed.
 	shuffleSeed int64
 
 	// Cached spec presence flags - indicate if preset supports these specs
@@ -71,6 +80,12 @@ type HTTP2Transport struct {
 	insecureSkipVerify   bool
 	tlsVerify            *TLSVerify
 	localAddr            string // Local IP to bind outgoing connections
+
+	// canonicalHeadersForTest makes the transport behave as releases before
+	// WireCaseResponseHeaders did: connections are built with it off and no
+	// trace is layered for 1xx maps. Tests set it to get the reference that
+	// RoundTrip is compared against; nothing else does.
+	canonicalHeadersForTest bool
 
 	// Cleanup
 	stopCleanup     chan struct{}
@@ -257,9 +272,8 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		sessionCache = NewPersistableSessionCache()
 	}
 
-	// Generate random seed for TLS extension shuffling
-	// Chrome shuffles extensions once per session, not per connection
-	// This seed ensures consistent ordering across all connections in this transport
+	// Seed for the spec builder. It does not pin the extension order and must
+	// not be made to; see the shuffleSeed field for why it is inert here.
 	var seedBytes [8]byte
 	crand.Read(seedBytes[:])
 	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
@@ -286,7 +300,10 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		shuffleSeed:  shuffleSeed,
 		hasPSKSpec:   hasPSKSpec,
 		maxIdleTime:  90 * time.Second,
-		maxConnAge:   5 * time.Minute,
+		// A connection older than this takes no new requests; zero means no
+		// limit. Five minutes unless TransportConfig.HTTP2MaxConnAge says
+		// otherwise.
+		maxConnAge: defaultHTTP2MaxConnAge,
 		// A response body that has not produced a single byte for this long is
 		// treated as abandoned by its caller, so the connection can be
 		// reclaimed. Without a bound here, a caller that never closes a body
@@ -294,6 +311,11 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		abandonedBodyTimeout: 10 * time.Minute,
 		connectTimeout:       30 * time.Second,
 		stopCleanup:          make(chan struct{}),
+	}
+	if config != nil && config.HTTP2MaxConnAge > 0 {
+		t.maxConnAge = config.HTTP2MaxConnAge
+	} else if config != nil && config.HTTP2MaxConnAge < 0 {
+		t.maxConnAge = 0 // turned off
 	}
 
 	// Apply localAddr from config
@@ -307,12 +329,79 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	return t
 }
 
+// maxHTTP2Retries is how many times a request that failed before its response
+// headers is sent again, so it goes out at most maxHTTP2Retries+1 times. It is
+// Chrome's kMaxRetryAttempts, one budget shared by every retryable reason.
+// Measured against Chrome 155: two refusals and the third send lands, three and
+// the load fails after exactly three HEADERS, all on one connection.
+const maxHTTP2Retries = 2
+
+// isRefusedStream reports a RST_STREAM(REFUSED_STREAM) from the server.
+func isRefusedStream(err error) bool {
+	var se http2.StreamError
+	return errors.As(err, &se) && se.Code == http2.ErrCodeRefusedStream
+}
+
+// retryableHTTP2Request narrows the fork's retry predicate to Chrome's list.
+// The fork also replays a RST_STREAM(PROTOCOL_ERROR) from the peer, inherited
+// from golang/go#47635. Chrome maps that to ERR_HTTP2_PROTOCOL_ERROR, which is
+// not on its retry list, and fails after one send.
+func retryableHTTP2Request(req *http.Request, err error) (*http.Request, error) {
+	var se http2.StreamError
+	if errors.As(err, &se) && se.Code != http2.ErrCodeRefusedStream {
+		return nil, err
+	}
+	return http2.ShouldRetryRequest(req, err)
+}
+
+// connClosing reports whether a connection can no longer open streams. It is
+// not CanTakeNewRequest, which is also false for a healthy connection that is
+// merely at its concurrent stream limit.
+func connClosing(c *persistentConn) bool {
+	st := c.h2Conn.State()
+	return st.Closed || st.Closing
+}
+
 // RoundTrip implements http.RoundTripper
+//
+// The response's Header is keyed in canonical form, exactly as it was before
+// the connection started asking the HTTP/2 layer for the wire's lowercase names
+// (WireCaseResponseHeaders), so Header.Get, Cookies and Location work as they
+// do on any net/http response. Trailers are canonical as always, and the 1xx
+// header maps a ClientTrace's Got1xxResponse receives are canonical too. Only
+// this exported entry point converts: the Transport's own requests keep the
+// wire case, because they lowercase every name for Response.Headers anyway.
 func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, _, err := t.roundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	respheader.Canonical(resp.Header)
+	return resp, nil
+}
+
+// roundTrip is RoundTrip, also saying whether any of the request may have
+// reached the server. sent is false only when no connection could be had for
+// the first attempt, so nothing was written.
+//
+// The response's Header is keyed as the wire carried it. Callers inside this
+// package read it through internal/respheader or by exact key; RoundTrip
+// converts it for everyone else.
+func (t *HTTP2Transport) roundTrip(req *http.Request) (resp *http.Response, sent bool, err error) {
+	// A 1xx map reaches a caller's trace during the round trip, so it is made
+	// canonical here, on every path, rather than at RoundTrip's return. The
+	// request the response records is put back to the caller's below.
+	if !t.canonicalHeadersForTest {
+		if ctx, ok := respheader.WithCanonical1xx(req.Context()); ok {
+			orig, copied := req, req.WithContext(ctx)
+			req = copied
+			defer func() { respheader.RestoreRequest(resp, copied, orig) }()
+		}
+	}
 	t.connsMu.RLock()
 	if t.closed {
 		t.connsMu.RUnlock()
-		return nil, fmt.Errorf("http2: transport closed")
+		return nil, false, fmt.Errorf("http2: transport closed")
 	}
 	t.connsMu.RUnlock()
 
@@ -328,7 +417,7 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Try to get existing connection (pass request host for SNI, connectHost used internally for DNS)
 	conn, err := t.getOrCreateConn(req.Context(), host, port, key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Mark conn as in-use so cleanup() doesn't close it mid-flight
@@ -338,19 +427,29 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	conn.mu.Unlock()
 
 	// Make request
-	resp, err := conn.h2Conn.RoundTrip(req)
-	if err != nil {
+	resp, err = conn.h2Conn.RoundTrip(req)
+	for attempt := 0; err != nil; attempt++ {
 		// release(), not a bare decrement: if this conn was evicted while the
 		// request was in flight its close was deferred, and only release()
 		// fires it once the count reaches zero.
 		conn.release()
 
-		// Connection might be dead, remove it before deciding anything.
-		t.removeConn(key)
+		// A refused stream closes one stream and says nothing about the
+		// connection, so Chrome resends on the session it already has. Every
+		// other failure, and a refusal on a connection that is closing anyway,
+		// means the connection is gone and the next attempt needs a new one.
+		if !isRefusedStream(err) || connClosing(conn) {
+			t.removeConn(key)
+		}
 
 		// Don't retry if context is already done (e.g. timeout expired)
 		if req.Context().Err() != nil {
-			return nil, req.Context().Err()
+			return nil, true, req.Context().Err()
+		}
+
+		// Chrome's budget: kMaxRetryAttempts in http_network_transaction.cc.
+		if attempt == maxHTTP2Retries {
+			return nil, true, err
 		}
 
 		// Ask whether this is a failure worth replaying, and get the request
@@ -366,31 +465,27 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// a comment describing the same failure.
 		//
 		// And the classification: a browser replays a refused stream or a
-		// graceful GOAWAY, and gives up on RST_STREAM(INTERNAL_ERROR) before
-		// headers, and never makes a second HTTP/2 attempt after
-		// HTTP_1_1_REQUIRED. Retrying everything produced two HEADERS arrivals
-		// where a real client produces one, on exactly the errors a server
-		// chooses to send.
-		retryReq, retryErr := http2.ShouldRetryRequest(req, err)
+		// graceful GOAWAY, and gives up on RST_STREAM(INTERNAL_ERROR) or
+		// RST_STREAM(PROTOCOL_ERROR) before headers, and never makes a second
+		// HTTP/2 attempt after HTTP_1_1_REQUIRED. Retrying everything produced
+		// two HEADERS arrivals where a real client produces one, on exactly the
+		// errors a server chooses to send.
+		retryReq, retryErr := retryableHTTP2Request(req, err)
 		if retryErr != nil || retryReq == nil {
-			return nil, err
+			return nil, true, err
 		}
+		req = retryReq
 
 		conn, err = t.getOrCreateConn(req.Context(), host, port, key)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
 
 		conn.mu.Lock()
 		conn.inFlight++
 		conn.mu.Unlock()
 
-		resp, err = conn.h2Conn.RoundTrip(retryReq)
-		if err != nil {
-			conn.release()
-			t.removeConn(key)
-			return nil, err
-		}
+		resp, err = conn.h2Conn.RoundTrip(req)
 	}
 
 	// Keep the connection marked in-use until the caller finishes with the body.
@@ -408,7 +503,7 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp.Body = &connBodyGuard{ReadCloser: resp.Body, conn: conn}
 	}
 
-	return resp, nil
+	return resp, true, nil
 }
 
 // getOrCreateConn gets an existing connection or creates a new one.
@@ -459,9 +554,12 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 	// leader is set only inside the closure singleflight actually executes (the
 	// winner); coalesced waiters pass their own closures which never run, so their
 	// leader stays false. This lets a waiter recognise when it received the
-	// leader's result and react differently for connection-bearing errors.
+	// leader's result and react differently for connection-bearing errors. The
+	// closure runs on its own goroutine, and its write to leader happens before
+	// the result is sent on the channel, so reading leader after receiving is
+	// safe.
 	leader := false
-	v, err, _ := t.dialGroup.Do(key, func() (interface{}, error) {
+	ch := t.dialGroup.DoChan(key, func() (interface{}, error) {
 		leader = true
 		// A usable conn may have been published between our checks above and
 		// winning the singleflight slot.
@@ -514,6 +612,26 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 		t.connsMu.Unlock()
 		return newConn, nil
 	})
+
+	// Every caller, the leader included, stops waiting when its own context
+	// ends. The dial itself runs detached and carries on for the others; a
+	// connection it opens is published to the pool, so nothing is lost. The one
+	// thing nobody would own is the live connection an ALPN downgrade hands to
+	// the leader, so a leader that leaves closes it once the dial returns.
+	var res singleflight.Result
+	select {
+	case res = <-ch:
+	case <-ctx.Done():
+		go func() {
+			r := <-ch
+			var alpnErr *ALPNMismatchError
+			if leader && errors.As(r.Err, &alpnErr) && alpnErr.TLSConn != nil {
+				alpnErr.TLSConn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+	v, err := res.Val, res.Err
 	if err != nil {
 		// An ALPN downgrade returns a single live TLS connection carried inside
 		// the error, meant for ONE owner to serve over HTTP/1.1. singleflight
@@ -530,6 +648,11 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 	return v.(*persistentConn), nil
 }
 
+// defaultHTTP2MaxConnAge is how old an HTTP/2 connection may get before new
+// requests go out on a fresh one, unless the caller sets a limit or turns it
+// off.
+const defaultHTTP2MaxConnAge = 5 * time.Minute
+
 // isConnUsable reports whether a connection may be handed out for a NEW request.
 //
 // This is deliberately separate from isConnDestroyable: "too old to start
@@ -541,30 +664,29 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 // even when the connection is fine. We'll handle errors during actual use.
 func (t *HTTP2Transport) isConnUsable(conn *persistentConn) bool {
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
-
-	// Already evicted and waiting for its last body to finish.
-	if conn.closeRequested {
+	// Not evicted and waiting for its last body, not too old, and not idle
+	// for too long. Idle time doesn't count while requests are in flight,
+	// or cleanup would kill long downloads (>maxIdleTime).
+	usable := !conn.closeRequested &&
+		(t.maxConnAge <= 0 || time.Since(conn.createdAt) <= t.maxConnAge) &&
+		(conn.inFlight > 0 || time.Since(conn.lastUsedAt) <= t.maxIdleTime)
+	h2Conn := conn.h2Conn
+	conn.mu.Unlock()
+	if !usable || h2Conn == nil {
 		return false
 	}
 
-	// Check age
-	if time.Since(conn.createdAt) > t.maxConnAge {
-		return false
-	}
-
-	// Check idle time — but not if requests are actively in-flight.
-	// Without this, long downloads (>maxIdleTime) get killed by cleanup.
-	if conn.inFlight == 0 && time.Since(conn.lastUsedAt) > t.maxIdleTime {
-		return false
-	}
-
-	// Just check if connection object exists - we'll handle errors during RoundTrip
-	if conn.h2Conn == nil {
-		return false
-	}
-
-	return true
+	// A connection the server has sent GOAWAY on, or that has died, can open
+	// no more streams. Handing it out only fails the request and leans on the
+	// retry to recover, which a request whose body can't be replayed doesn't
+	// get, and servers send GOAWAY on idle connections routinely (#141).
+	//
+	// This must not be State(): that takes the HTTP/2 write lock, which a
+	// stalled upload on the same connection holds for as long as it is stuck,
+	// and every new request to the host would wait on it here, before
+	// RoundTrip, where its own deadline can't reach it. Closing takes only
+	// the connection's state lock.
+	return !h2Conn.Closing()
 }
 
 // isConnDestroyable reports whether a connection can be closed right now.
@@ -593,7 +715,7 @@ func (t *HTTP2Transport) isConnDestroyable(conn *persistentConn) bool {
 	if h2Conn == nil {
 		return true
 	}
-	if time.Since(conn.createdAt) > t.maxConnAge {
+	if t.maxConnAge > 0 && time.Since(conn.createdAt) > t.maxConnAge {
 		return true
 	}
 	return time.Since(lastUsedAt) > t.maxIdleTime
@@ -960,6 +1082,9 @@ alpnCheck:
 			return nil
 		}(),
 	})
+	if t.canonicalHeadersForTest {
+		h2Transport.WireCaseResponseHeaders = false
+	}
 
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {

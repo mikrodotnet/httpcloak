@@ -28,10 +28,12 @@ import (
 // priority frame plus the request headers (so the test can correlate by
 // :path or sec-fetch-dest).
 type h2Capture struct {
-	StreamID    uint32
-	HasPriority bool
-	Priority    http2.PriorityParam // wire-format weight (effective-1)
-	Headers     map[string]string
+	Settings     []http2.Setting
+	WindowUpdate uint32
+	StreamID     uint32
+	HasPriority  bool
+	Priority     http2.PriorityParam // wire-format weight (effective-1)
+	Headers      map[string]string
 	// HeaderOrder is the ordered list of header NAMES exactly as the client
 	// emitted them on the wire. Tests that need to verify HPACK position
 	// (vs. just presence/value) read this; existing tests stay on Headers.
@@ -160,6 +162,8 @@ func (s *h2CaptureServer) handleConn(t *testing.T, c net.Conn) {
 	var encBuf strings.Builder
 	enc = hpack.NewEncoder(&encBuf)
 
+	var settings []http2.Setting
+	var windowUpdate uint32
 	for {
 		frame, err := fr.ReadFrame()
 		if err != nil {
@@ -168,17 +172,25 @@ func (s *h2CaptureServer) handleConn(t *testing.T, c net.Conn) {
 		switch f := frame.(type) {
 		case *http2.SettingsFrame:
 			if !f.IsAck() {
+				f.ForeachSetting(func(setting http2.Setting) error {
+					settings = append(settings, setting)
+					return nil
+				})
 				_ = fr.WriteSettingsAck()
 			}
 		case *http2.WindowUpdateFrame:
-			// ignore
+			if f.StreamID == 0 {
+				windowUpdate = f.Increment
+			}
 		case *http2.MetaHeadersFrame:
 			cap := h2Capture{
-				StreamID:    f.StreamID,
-				HasPriority: f.HasPriority(),
-				Priority:    f.Priority,
-				Headers:     map[string]string{},
-				HeaderOrder: make([]string, 0, len(f.Fields)),
+				Settings:     append([]http2.Setting(nil), settings...),
+				WindowUpdate: windowUpdate,
+				StreamID:     f.StreamID,
+				HasPriority:  f.HasPriority(),
+				Priority:     f.Priority,
+				Headers:      map[string]string{},
+				HeaderOrder:  make([]string, 0, len(f.Fields)),
 			}
 			for _, hf := range f.Fields {
 				cap.Headers[hf.Name] = hf.Value
@@ -239,7 +251,7 @@ func fireGet(t *testing.T, srv *h2CaptureServer, preset *fingerprint.Preset, sec
 
 	// Mirror what the higher-level Transport.RoundTrip wrapper does on the
 	// httpcloak side before handing the *http.Request to HTTP2Transport.
-	applyPresetHeaders(req, preset, nil, nil, false, "h2", userHeaders, false, nil)
+	applyPresetHeaders(req, newPresetWireHeaders(preset), nil, nil, false, "h2", userHeaders, false, nil)
 
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
@@ -393,28 +405,34 @@ func TestPriorityTable_WireEmission_NoRFC7540PresetSingleWeight(t *testing.T) {
 	}
 }
 
-// TestPriorityTable_WireEmission_UnknownDestFallsBack verifies that when a
-// chrome-147 preset receives a Sec-Fetch-Dest it doesn't know about, the
-// transport falls back to the static StreamWeight. This means the dest
-// table is purely additive: weird dests never break things.
+// TestPriorityTable_WireEmission_UnknownDestFallsBack verifies that a dest the
+// table does not know never breaks a request, and that the weight it gets
+// still agrees with the priority header it carries. The header pipeline gives
+// such a request the CORS priority, u=1, i, so the weight is 220. This test
+// used to require the static 256 here, which put u=1 in the header and u=0's
+// weight in the frame, a pair no Chrome build sends (#129). The fallback to
+// the static weight, for an unknown dest with no header at all, is covered in
+// TestStreamWeightFollowsTheRequestsPriorityHeader.
 func TestPriorityTable_WireEmission_UnknownDestFallsBack(t *testing.T) {
 	preset := fingerprint.Get("chrome-147-windows")
 	if preset == nil {
 		t.Skip("chrome-147-windows preset unavailable")
 	}
 
-	staticWeight := uint8(preset.HTTP2Settings.StreamWeight - 1)
 	staticExcl := preset.HTTP2Settings.StreamExclusive
 
 	srv := startH2CaptureServer(t)
 	c := fireGet(t, srv, preset, "made-up-dest-xyz")
 
 	if !c.HasPriority {
-		t.Fatalf("HasPriority=false (should fall back to static, not omit)")
+		t.Fatalf("HasPriority=false (should fall back, not omit)")
 	}
-	if c.Priority.Weight != staticWeight {
-		t.Errorf("unknown dest: wire weight = %d, want %d (fall back to static)",
-			c.Priority.Weight, staticWeight)
+	if c.Headers["priority"] != "u=1, i" {
+		t.Fatalf("unknown dest: priority header = %q, want the CORS u=1, i", c.Headers["priority"])
+	}
+	if got := int(c.Priority.Weight) + 1; got != 220 {
+		t.Errorf("unknown dest (priority %q): weight = %d, want 220 to match the header",
+			c.Headers["priority"], got)
 	}
 	if c.Priority.Exclusive != staticExcl {
 		t.Errorf("unknown dest: exclusive = %v, want %v (fall back)",

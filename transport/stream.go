@@ -3,19 +3,21 @@ package transport
 import (
 	"bufio"
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"errors"
+	"github.com/sardanioss/httpcloak/internal/respheader"
 	"io"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	http "github.com/sardanioss/http"
+	"github.com/sardanioss/httpcloak/internal/compress"
+	"github.com/sardanioss/httpcloak/internal/gunzip"
 	"github.com/sardanioss/httpcloak/protocol"
 )
 
@@ -80,18 +82,34 @@ func (r *StreamResponse) Read(p []byte) (n int, err error) {
 	return r.reader.Read(p)
 }
 
-// Close closes the response body and cancels the context
+// Close closes the response body and cancels the stream context.
+//
+// On HTTP/2 the body is closed first. Closing a fully read body there lets the
+// stream wait for the server's END_STREAM, where cancelling first reset it
+// with RST_STREAM(CANCEL) on a response that had succeeded (#117). Everywhere
+// else the context is cancelled first, as before: an HTTP/1.1 body drains on
+// Close to keep the connection reusable, so closing an endless stream (SSE, a
+// long download) before cancelling it would block for good.
+//
+// The decompressor is closed after the body. A zstd decoder's Close waits for
+// its reader goroutine, which sits in a read of the body; on HTTP/2 nothing
+// has been cancelled yet at that point, so closing the decoder first hung
+// until the server sent more data, forever on an idle stream.
 func (r *StreamResponse) Close() error {
-	if r.cancel != nil {
+	if r.Protocol != "h2" && r.cancel != nil {
 		r.cancel()
+	}
+	var err error
+	if r.rawReader != nil {
+		err = r.rawReader.Close()
 	}
 	if r.decompressor != nil {
 		r.decompressor.Close()
 	}
-	if r.rawReader != nil {
-		return r.rawReader.Close()
+	if r.cancel != nil {
+		r.cancel() // a no-op after the first call
 	}
-	return nil
+	return err
 }
 
 // ReadAll reads the entire response body into memory
@@ -145,7 +163,9 @@ func (r *StreamResponse) IsSuccess() bool {
 
 // DoStream executes an HTTP request and returns a streaming response
 // The caller is responsible for closing the response when done
-func (t *Transport) DoStream(ctx context.Context, req *Request) (*StreamResponse, error) {
+func (t *Transport) DoStream(ctx context.Context, req *Request) (response *StreamResponse, err error) {
+	defer func() { closeUnusedALPNConn(err) }()
+
 	// Parse URL to determine scheme
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -271,10 +291,11 @@ func (t *Transport) doStreamAuto(ctx context.Context, req *Request) (*StreamResp
 			if err == nil {
 				return resp, nil
 			}
-			if req.BodyReader != nil {
+			if !canResendOnAnotherProtocol(req, err) {
 				// A one-shot BodyReader may have been partially drained by the
-				// H3 attempt; re-sending it on H2 would corrupt the body. Surface
-				// the H3 error instead of silently sending a truncated request.
+				// H3 attempt, and a request that is not idempotent may already
+				// have reached the server. Surface the H3 error instead of
+				// sending a truncated or duplicate request.
 				return nil, err
 			}
 			return t.doStreamHTTP2OrHTTP1(ctx, req)
@@ -321,11 +342,12 @@ func (t *Transport) doStreamAuto(ctx context.Context, req *Request) (*StreamResp
 				t.cacheProtocol(host, ProtocolHTTP3)
 				return resp, nil
 			}
-			if req.BodyReader != nil {
-				// One-shot body may be drained; do not re-send on H2 (see above).
+			if !canResendOnAnotherProtocol(req, err) {
+				// Drained body or a possible duplicate; do not re-send on H2
+				// (see above).
 				return nil, err
 			}
-			// Replayable body (or none): fall through to H2.
+			// Safe to send again: fall through to H2.
 		}
 	}
 
@@ -415,9 +437,10 @@ func (t *Transport) doStreamHTTP1(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints, req.ExactHeaders)
+	applyPresetHeaders(httpReq, t.wireHeaders(snap.preset), t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h1", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	mergeCallerHeaders(httpReq, req)
+	mergeCallerHeaders(httpReq, req, "h1")
+	stripH1Priority(httpReq, req, snap.preset, effectiveTLSOnly)
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -443,7 +466,7 @@ func (t *Transport) doStreamHTTP1(ctx context.Context, req *Request) (*StreamRes
 	headers := buildHeadersMap(resp.Header)
 
 	// Setup decompression reader
-	reader, decompressor := setupStreamDecompressor(resp.Body, resp.Header.Get("Content-Encoding"))
+	reader, decompressor := setupStreamDecompressor(resp.Body, respheader.ContentEncoding(resp.Header))
 
 	return &StreamResponse{
 		StatusCode:    resp.StatusCode,
@@ -515,9 +538,9 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers, req.DisableClientHints, req.ExactHeaders)
+	applyPresetHeaders(httpReq, t.wireHeaders(snap.preset), t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h2", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	mergeCallerHeaders(httpReq, req)
+	mergeCallerHeaders(httpReq, req, "h2")
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -527,7 +550,10 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 	finishEstablishment := boundStreamEstablishment(t.streamEffectiveTimeout(req), cancel)
 
 	// Make request
-	resp, err := snap.h2.RoundTrip(httpReq)
+	// roundTrip, not RoundTrip: the exported one converts the header map to
+	// canonical keys for outside callers, and adoption below wants it as the
+	// wire carried it.
+	resp, _, err := snap.h2.roundTrip(httpReq)
 	finishEstablishment()
 	if err != nil {
 		cancel()
@@ -537,16 +563,18 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
-	// Build response headers map
-	headers := buildHeadersMap(resp.Header)
+	// Adopt the fork's wire-case header map; the order read must come first,
+	// adoption strips the bookkeeping entry it answers from.
+	headerOrder := responseHeaderOrder(resp.Header)
+	headers := adoptWireHeaders(resp.Header)
 
 	// Setup decompression reader
-	reader, decompressor := setupStreamDecompressor(resp.Body, resp.Header.Get("Content-Encoding"))
+	reader, decompressor := setupStreamDecompressor(resp.Body, respheader.ContentEncoding(resp.Header))
 
 	return &StreamResponse{
 		StatusCode:    resp.StatusCode,
 		Headers:       headers,
-		HeaderOrder:   responseHeaderOrder(resp.Header),
+		HeaderOrder:   headerOrder,
 		httpResp:      resp,
 		FinalURL:      req.URL,
 		Timing:        timing,
@@ -581,9 +609,13 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 	if port == "" {
 		port = "443"
 	}
+	if snap.h3 == nil {
+		return nil, errHTTP3Disabled(host, port)
+	}
 
 	// For streaming, use cancellable context without additional timeout
 	ctx, cancel := context.WithCancel(ctx)
+	ctx, gotConn := withH3SendTrace(ctx)
 
 	// Build HTTP request
 	method := req.Method
@@ -613,9 +645,9 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 	}
 
 	// Set preset headers
-	applyPresetHeaders(httpReq, snap.preset, t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers, req.DisableClientHints, req.ExactHeaders)
+	applyPresetHeaders(httpReq, t.wireHeaders(snap.preset), t.effectiveHeaderOrder(req), t.getCustomPseudoOrder(), effectiveTLSOnly, "h3", req.Headers, req.DisableClientHints, req.ExactHeaders)
 
-	mergeCallerHeaders(httpReq, req)
+	mergeCallerHeaders(httpReq, req, "h3")
 
 	// Record timing before request
 	reqStart := time.Now()
@@ -629,7 +661,7 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 	finishEstablishment()
 	if err != nil {
 		cancel()
-		return nil, WrapError("roundtrip", host, port, "h3", err)
+		return nil, WrapError("roundtrip", host, port, "h3", h3NotSent(err, gotConn))
 	}
 
 	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
@@ -639,7 +671,7 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 	headers := buildHeadersMap(resp.Header)
 
 	// Setup decompression reader
-	reader, decompressor := setupStreamDecompressor(resp.Body, resp.Header.Get("Content-Encoding"))
+	reader, decompressor := setupStreamDecompressor(resp.Body, respheader.ContentEncoding(resp.Header))
 
 	return &StreamResponse{
 		StatusCode:    resp.StatusCode,
@@ -662,21 +694,29 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 func setupStreamDecompressor(body io.ReadCloser, encoding string) (io.ReadCloser, io.Closer) {
 	switch strings.ToLower(encoding) {
 	case "gzip":
-		reader, err := gzip.NewReader(body)
+		// The header is read here, before the stream is handed out, so a body
+		// whose header cannot be read still falls back to the raw bytes.
+		stream, err := gunzip.NewStream(body)
 		if err != nil {
 			return body, nil
 		}
-		return reader, reader
+		return stream, nil
 	case "br":
 		return &brotliStreamReader{brotli.NewReader(body)}, nil
 	case "deflate":
-		return &deflateStreamReader{flate.NewReader(body)}, nil
+		return &deflateStreamReader{compress.NewDeflateReader(body)}, nil
 	case "zstd":
 		decoder, err := zstd.NewReader(body)
 		if err != nil {
 			return body, nil
 		}
-		return &zstdStreamReader{decoder: decoder, body: body}, nil
+		// The decoder must be returned as the closer too. It runs goroutines
+		// until it is closed, and StreamResponse.Close closes only what comes
+		// back here, so with a nil closer a stream closed before its end left
+		// them running for good (#118). The closer releases the
+		// decoder alone; the body is closed separately, as rawReader.
+		z := &zstdStreamReader{decoder: decoder, body: body}
+		return z, zstdDecoderCloser{z}
 	default:
 		return body, nil
 	}
@@ -708,17 +748,40 @@ func (d *deflateStreamReader) Close() error {
 	return d.reader.Close()
 }
 
-// zstdStreamReader wraps zstd.Decoder to implement io.ReadCloser
+// zstdStreamReader wraps zstd.Decoder to implement io.ReadCloser.
+//
+// Decoder.Close must not run while a Read is inside the decoder, which a
+// stream closed from another goroutine (Lines, or a caller's own reader)
+// does, so Read and closeDecoder share a lock. A Read blocked on the network
+// holds it; closing the body first is what ends that Read.
 type zstdStreamReader struct {
+	mu      sync.Mutex
 	decoder *zstd.Decoder
 	body    io.ReadCloser
 }
 
 func (z *zstdStreamReader) Read(p []byte) (n int, err error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
 	return z.decoder.Read(p)
 }
 
-func (z *zstdStreamReader) Close() error {
+func (z *zstdStreamReader) closeDecoder() {
+	z.mu.Lock()
+	defer z.mu.Unlock()
 	z.decoder.Close()
-	return z.body.Close()
+}
+
+func (z *zstdStreamReader) Close() error {
+	err := z.body.Close()
+	z.closeDecoder()
+	return err
+}
+
+// zstdDecoderCloser closes a zstdStreamReader's decoder and not its body.
+type zstdDecoderCloser struct{ z *zstdStreamReader }
+
+func (c zstdDecoderCloser) Close() error {
+	c.z.closeDecoder()
+	return nil
 }

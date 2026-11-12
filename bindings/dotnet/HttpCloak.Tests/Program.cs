@@ -22,22 +22,19 @@ if (testArg == "proxy")
     return;
 }
 
-if (testArg == "bench")
+if (testArg == "headers")
 {
-    await BenchmarkTest.RunAsync();
-    return;
+    Environment.Exit(TestHeaderSpelling.Run() ? 0 : 1);
 }
 
-if (testArg == "throughput")
+if (testArg == "cache")
 {
-    await ThroughputTest.RunAsync();
-    return;
+    Environment.Exit(await TestSessionCache.RunAsync() ? 0 : 1);
 }
 
-if (testArg == "rawspeed")
+if (testArg == "gcstress")
 {
-    await RawSpeedTest.RunAsync();
-    return;
+    Environment.Exit(await TestGcStress.RunAsync(cmdArgs) ? 0 : 1);
 }
 
 Console.WriteLine(new string('=', 70));

@@ -40,7 +40,53 @@ const Preset = {
   CHROME_LATEST_IOS: "chrome-latest-ios",
   CHROME_LATEST_ANDROID: "chrome-latest-android",
 
-  // Chrome 149 (desktop; wire fingerprint identical to 148)
+  // Chrome 153 (headers-only over 152; no iOS preset until one is captured)
+  CHROME_153: "chrome-153",
+  CHROME_153_WINDOWS: "chrome-153-windows",
+  CHROME_153_LINUX: "chrome-153-linux",
+  CHROME_153_MACOS: "chrome-153-macos",
+  CHROME_153_ANDROID: "chrome-153-android",
+  // Chrome 154 (headers-only over 153)
+  CHROME_154: "chrome-154",
+  CHROME_154_WINDOWS: "chrome-154-windows",
+  CHROME_154_LINUX: "chrome-154-linux",
+  CHROME_154_MACOS: "chrome-154-macos",
+  CHROME_154_ANDROID: "chrome-154-android",
+  // Chrome 155 (desktop and Android add image/jxl to Accept; TLS unchanged; iOS captured)
+  CHROME_155: "chrome-155",
+  CHROME_155_WINDOWS: "chrome-155-windows",
+  CHROME_155_LINUX: "chrome-155-linux",
+  CHROME_155_MACOS: "chrome-155-macos",
+  CHROME_155_IOS: "chrome-155-ios",
+  CHROME_155_ANDROID: "chrome-155-android",
+  // Chrome 156 (headers only over 155)
+  CHROME_156: "chrome-156",
+  CHROME_156_WINDOWS: "chrome-156-windows",
+  CHROME_156_LINUX: "chrome-156-linux",
+  CHROME_156_MACOS: "chrome-156-macos",
+  CHROME_156_ANDROID: "chrome-156-android",
+  // Chrome 157 (headers only over 156)
+  CHROME_157: "chrome-157",
+  CHROME_157_WINDOWS: "chrome-157-windows",
+  CHROME_157_LINUX: "chrome-157-linux",
+  CHROME_157_MACOS: "chrome-157-macos",
+  CHROME_157_ANDROID: "chrome-157-android",
+  // Chrome 158 (headers only over 157)
+  CHROME_158: "chrome-158",
+  CHROME_158_WINDOWS: "chrome-158-windows",
+  CHROME_158_LINUX: "chrome-158-linux",
+  CHROME_158_MACOS: "chrome-158-macos",
+  CHROME_158_ANDROID: "chrome-158-android",
+
+  // Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
+  CHROME_152: "chrome-152",
+  CHROME_152_WINDOWS: "chrome-152-windows",
+  CHROME_152_LINUX: "chrome-152-linux",
+  CHROME_152_MACOS: "chrome-152-macos",
+  CHROME_152_ANDROID: "chrome-152-android",
+  CHROME_152_IOS: "chrome-152-ios",
+
+  // Chrome 151 (headers only over 150)
   CHROME_151: "chrome-151",
   CHROME_151_WINDOWS: "chrome-151-windows",
   CHROME_151_LINUX: "chrome-151-linux",
@@ -132,6 +178,7 @@ const Preset = {
   SAFARI_18: "safari-18",
   SAFARI_17_IOS: "safari-17-ios",
   SAFARI_18_IOS: "safari-18-ios",
+  SAFARI_26_IOS: "safari-26-ios",
   SAFARI_LATEST_IOS: "safari-latest-ios",
 
   // Backwards compatibility aliases (old "ios-chrome" / "android-chrome" naming)
@@ -151,6 +198,7 @@ const Preset = {
   ANDROID_CHROME_LATEST: "chrome-latest-android",
   IOS_SAFARI_17: "safari-17-ios",
   IOS_SAFARI_18: "safari-18-ios",
+  IOS_SAFARI_26: "safari-26-ios",
   IOS_SAFARI_LATEST: "safari-latest-ios",
 
   /**
@@ -162,27 +210,15 @@ const Preset = {
    * @returns {string[]} List of preset names
    */
   all() {
-    return [
-      this.CHROME_LATEST, this.CHROME_LATEST_WINDOWS, this.CHROME_LATEST_LINUX,
-      this.CHROME_LATEST_MACOS, this.CHROME_LATEST_IOS, this.CHROME_LATEST_ANDROID,
-      this.CHROME_149, this.CHROME_149_WINDOWS, this.CHROME_149_LINUX, this.CHROME_149_MACOS,
-      this.CHROME_148, this.CHROME_148_WINDOWS, this.CHROME_148_LINUX, this.CHROME_148_MACOS,
-      this.CHROME_148_IOS, this.CHROME_148_ANDROID,
-      this.CHROME_147, this.CHROME_147_WINDOWS, this.CHROME_147_LINUX, this.CHROME_147_MACOS,
-      this.CHROME_147_IOS, this.CHROME_147_ANDROID,
-      this.CHROME_146, this.CHROME_146_WINDOWS, this.CHROME_146_LINUX, this.CHROME_146_MACOS,
-      this.CHROME_146_IOS, this.CHROME_146_ANDROID,
-      this.CHROME_145, this.CHROME_145_WINDOWS, this.CHROME_145_LINUX, this.CHROME_145_MACOS,
-      this.CHROME_145_IOS, this.CHROME_145_ANDROID,
-      this.CHROME_144, this.CHROME_144_WINDOWS, this.CHROME_144_LINUX, this.CHROME_144_MACOS,
-      this.CHROME_144_IOS, this.CHROME_144_ANDROID,
-      this.CHROME_143, this.CHROME_143_WINDOWS, this.CHROME_143_LINUX, this.CHROME_143_MACOS,
-      this.CHROME_143_IOS, this.CHROME_143_ANDROID,
-      this.CHROME_141, this.CHROME_133,
-      this.FIREFOX_LATEST, this.FIREFOX_148, this.FIREFOX_133,
-      this.SAFARI_LATEST, this.SAFARI_18, this.SAFARI_17_IOS, this.SAFARI_18_IOS,
-      this.SAFARI_LATEST_IOS,
-    ];
+    // Built from the constants above, each name once, so a new constant can
+    // never be left out of it.
+    const names = [];
+    for (const [key, value] of Object.entries(this)) {
+      if (/^[A-Z0-9_]+$/.test(key) && typeof value === "string" && !names.includes(value)) {
+        names.push(value);
+      }
+    }
+    return names;
   },
 };
 
@@ -757,6 +793,30 @@ class StreamResponse {
   }
 
   /**
+   * The trailer fields the server sent after the body, which is where gRPC
+   * puts its status. Call it once the body has been read to the end: trailers
+   * arrive after the body, so unlike Response.trailer this cannot be set when
+   * the stream opens. Before the end it reports the names the response
+   * announced in its Trailer header, each with no values, because that is all
+   * the server has sent so far.
+   * @returns {Object<string, string[]>}
+   */
+  trailer() {
+    if (this._closed) {
+      return {};
+    }
+    const json = this._lib.httpcloak_stream_trailer(this._handle);
+    if (!json) {
+      return {};
+    }
+    try {
+      return JSON.parse(json);
+    } catch {
+      return {};
+    }
+  }
+
+  /**
    * Close the stream and release resources.
    */
   close() {
@@ -975,6 +1035,8 @@ function getLib() {
       httpcloak_stream_request_async: nativeLibHandle.func("httpcloak_stream_request_async", "void", ["int64", "str", "int64"]),
       httpcloak_trim_memory: nativeLibHandle.func("httpcloak_trim_memory", "void", []),
       httpcloak_stream_get_metadata: nativeLibHandle.func("httpcloak_stream_get_metadata", HeapStr, ["int64"]),
+      httpcloak_stream_trailer: nativeLibHandle.func("httpcloak_stream_trailer", HeapStr, ["int64"]),
+      httpcloak_last_error: nativeLibHandle.func("httpcloak_last_error", HeapStr, ["int64"]),
       httpcloak_stream_read: nativeLibHandle.func("httpcloak_stream_read", HeapStr, ["int64", "int64"]),
       httpcloak_stream_close: nativeLibHandle.func("httpcloak_stream_close", "void", ["int64"]),
       // Chunked upload state machine (mirrors Python's stream_upload). Lets
@@ -1250,10 +1312,39 @@ function parseResponse(resultPtr, elapsed = 0) {
   return new Response(data, elapsed);
 }
 
+// A JavaScript session cache runs its callbacks on the JS thread. A call that
+// blocks that thread and then needs a new TLS handshake waits on a callback
+// that cannot run until the call returns, so it would hang for good. Those
+// calls are refused on a session that has such a cache. A session keeps the
+// cache it was created with, so it is the session that is checked, not
+// whether a cache is configured now.
+function refuseIfSessionUsesJsCache(session, method) {
+  if (session._usesJsCache) {
+    throw new HTTPCloakError(
+      `${method}() blocks the JavaScript thread, which this session's cache needs to run its callbacks. ` +
+      "Use the async methods, or create the session while no session cache is configured."
+    );
+  }
+}
+
+/**
+ * Why the most recent handle-returning call on a session failed. Those calls
+ * return -1 and cannot carry a message, so without this every failure, from
+ * invalid request JSON to a refused connection, read the same.
+ * @param {Object} lib - Native library
+ * @param {number|bigint} sessionHandle - Session the call was made on
+ * @param {string} fallback - Message when the library recorded none
+ * @returns {string}
+ */
+function lastError(lib, sessionHandle, fallback) {
+  const message = lib.httpcloak_last_error(sessionHandle);
+  return message || fallback;
+}
+
 /**
  * Parse a raw response handle returned by httpcloak_*_raw into a Response
  * with a binary Buffer body. Avoids the base64 round trip used by the JSON
- * path — binary bodies (PDFs, images, streams) land in memory once.
+ * path: binary bodies (PDFs, images, streams) land in memory once.
  * @param {Object} lib - Native library binding
  * @param {number|bigint} responseHandle
  * @param {number} [elapsed=0] - Elapsed milliseconds
@@ -1344,8 +1435,25 @@ function applyAuth(headers, auth) {
   const credentials = Buffer.from(`${username}:${password}`).toString("base64");
 
   headers = headers ? { ...headers } : {};
+  // auth wins over an Authorization header in any spelling, and only one goes out.
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "authorization") delete headers[key];
+  }
   headers["Authorization"] = `Basic ${credentials}`;
   return headers;
+}
+
+/**
+ * Set name to value unless the caller already set it, in any spelling. The
+ * transport sends one spelling of a header name and prefers the canonical
+ * one, so a default added beside a caller's lowercase spelling would replace
+ * the caller's value.
+ */
+function defaultHeader(headers, name, value) {
+  const lname = name.toLowerCase();
+  if (!Object.keys(headers).some((k) => k.toLowerCase() === lname)) {
+    headers[name] = value;
+  }
 }
 
 /**
@@ -1542,7 +1650,7 @@ class Session {
   /**
    * Create a new session
    * @param {Object} options - Session options
-   * @param {string} [options.preset="chrome-146"] - Browser preset to use
+   * @param {string} [options.preset="chrome-latest"] - Browser preset to use
    * @param {string} [options.proxy] - Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port")
    * @param {string} [options.tcpProxy] - Proxy URL for TCP protocols (HTTP/1.1, HTTP/2) - use with udpProxy for split config
    * @param {string} [options.udpProxy] - Proxy URL for UDP protocols (HTTP/3 via MASQUE) - use with tcpProxy for split config
@@ -1560,10 +1668,11 @@ class Session {
    * @param {string} [options.echConfigDomain] - Domain to fetch ECH config from (e.g., "cloudflare-ech.com")
    * @param {boolean} [options.tlsOnly=false] - TLS-only mode: skip preset HTTP headers, only apply TLS fingerprint
    * @param {number} [options.quicIdleTimeout=0] - QUIC idle timeout in seconds (default: 30, 0 uses default)
+   * @param {number} [options.http2MaxConnAge] - Seconds after which an HTTP/2 connection takes no new requests (default: five minutes; 0 turns the limit off)
    */
   constructor(options = {}) {
     const {
-      preset = "chrome-146",
+      preset = "chrome-latest",
       proxy = null,
       tcpProxy = null,
       udpProxy = null,
@@ -1582,6 +1691,7 @@ class Session {
       echConfigDomain = null,
       tlsOnly = false,
       quicIdleTimeout = 0,
+      http2MaxConnAge = null,
       localAddress = null,
       keyLogFile = null,
       enableSpeculativeTls = false,
@@ -1654,6 +1764,14 @@ class Session {
     if (quicIdleTimeout > 0) {
       config.quic_idle_timeout = quicIdleTimeout;
     }
+    if (http2MaxConnAge !== null && http2MaxConnAge !== undefined) {
+      // The library takes whole seconds; a fraction went over as one it could
+      // not read, and that turned the limit off.
+      if (typeof http2MaxConnAge !== "number" || !Number.isFinite(http2MaxConnAge)) {
+        throw new TypeError("http2MaxConnAge must be a number of seconds");
+      }
+      config.http2_max_conn_age = Math.ceil(http2MaxConnAge);
+    }
     if (localAddress) {
       config.local_address = localAddress;
     }
@@ -1711,6 +1829,9 @@ class Session {
       config.tcp_df = tcpDf;
     }
 
+    // The library hands a session the cache configured when it is created and
+    // keeps it for the session's life, clearSessionCache() or not.
+    this._usesJsCache = _sessionCacheBackend !== null;
     this._handle = this._lib.httpcloak_session_new(JSON.stringify(config));
 
     if (this._handle === 0n || this._handle === 0) {
@@ -1760,6 +1881,7 @@ class Session {
    * @param {number} [options.timeout] - Timeout in milliseconds (default: 60000).
    */
   warmup(url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "warmup");
     if (this._handle) {
       const timeoutMs = options.timeout || 0;
       const result = this._lib.httpcloak_session_warmup(this._handle, url, timeoutMs);
@@ -1792,6 +1914,7 @@ class Session {
       const session = Object.create(Session.prototype);
       session._lib = this._lib;
       session._handle = handle;
+      session._usesJsCache = this._usesJsCache;
       session.headers = { ...this.headers };
       session.auth = this.auth;
       forks.push(session);
@@ -1804,9 +1927,26 @@ class Session {
    */
   _mergeHeaders(headers) {
     if (!this.headers || Object.keys(this.headers).length === 0) {
-      return headers;
+      // A copy: json/data/files write their Content-Type into what this
+      // returns, and that used to land in the caller's own object.
+      return headers ? { ...headers } : headers;
     }
-    return { ...this.headers, ...headers };
+    // Header names are case-insensitive: a request's "authorization" replaces
+    // the session's "Authorization" instead of going out beside it as a second
+    // Authorization line.
+    const merged = { ...this.headers };
+    if (headers) {
+      const names = new Map(Object.keys(merged).map((k) => [k.toLowerCase(), k]));
+      for (const [key, value] of Object.entries(headers)) {
+        const previous = names.get(key.toLowerCase());
+        if (previous !== undefined && previous !== key) {
+          delete merged[previous];
+        }
+        merged[key] = value;
+        names.set(key.toLowerCase(), key);
+      }
+    }
+    return merged;
   }
 
   /**
@@ -1825,11 +1965,14 @@ class Session {
       .join("; ");
 
     headers = headers ? { ...headers } : {};
-    const existing = headers["Cookie"] || "";
+    // Merge with an existing Cookie header in whatever case it was given, so a
+    // caller's "cookie" and these don't become two Cookie headers.
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === "cookie") || "Cookie";
+    const existing = headers[key] || "";
     if (existing) {
-      headers["Cookie"] = `${existing}; ${cookieStr}`;
+      headers[key] = `${existing}; ${cookieStr}`;
     } else {
-      headers["Cookie"] = cookieStr;
+      headers[key] = cookieStr;
     }
     return headers;
   }
@@ -1849,6 +1992,7 @@ class Session {
    * @returns {Response} Response object
    */
   getSync(url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "getSync");
     // The get_raw entry has no exact_headers field, so a caller asking for one
     // goes down the generic request path instead of having it dropped in silence.
     if (options.exactHeaders) return this.requestSync("GET", url, options);
@@ -1890,7 +2034,7 @@ class Session {
     const responseHandle = this._lib.httpcloak_get_raw(this._handle, url, optionsJson);
     const elapsed = Date.now() - startTime;
     if (responseHandle < 0 || responseHandle === 0 || responseHandle === 0n) {
-      throw new HTTPCloakError("Request failed");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Request failed"));
     }
     return parseRawResponse(this._lib, responseHandle, elapsed);
   }
@@ -1913,6 +2057,7 @@ class Session {
    * @returns {Response} Response object
    */
   postSync(url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "postSync");
     // The post_raw entry has no exact_headers field, so a caller asking for one
     // goes down the generic request path instead of having it dropped in silence.
     if (options.exactHeaders) return this.requestSync("POST", url, options);
@@ -1933,15 +2078,11 @@ class Session {
     } else if (json !== null) {
       bodyBuffer = Buffer.from(JSON.stringify(json), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     } else if (data !== null && typeof data === "object") {
       bodyBuffer = Buffer.from(new URLSearchParams(data).toString(), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     } else if (Buffer.isBuffer(body)) {
       bodyBuffer = body;
     } else if (typeof body === "string") {
@@ -1985,7 +2126,7 @@ class Session {
     const responseHandle = this._lib.httpcloak_post_raw(this._handle, url, bodyPtr, bodyLen, optionsJson);
     const elapsed = Date.now() - startTime;
     if (responseHandle < 0 || responseHandle === 0 || responseHandle === 0n) {
-      throw new HTTPCloakError("Request failed");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Request failed"));
     }
     return parseRawResponse(this._lib, responseHandle, elapsed);
   }
@@ -2000,6 +2141,7 @@ class Session {
    * @returns {Response} Response object
    */
   requestSync(method, url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "requestSync");
     let { body = null, json = null, data = null, files = null, headers = null, params = null, cookies = null, auth = null, timeout = null, fetchMode = null, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false, exactHeaders = null, headerOrder = null } = options;
 
     const exact = normalizeExactHeaders(exactHeaders);
@@ -2019,15 +2161,11 @@ class Session {
     } else if (json !== null) {
       bodyBuffer = Buffer.from(JSON.stringify(json), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     } else if (data !== null && typeof data === "object") {
       bodyBuffer = Buffer.from(new URLSearchParams(data).toString(), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     } else if (Buffer.isBuffer(body)) {
       bodyBuffer = body;
     } else if (typeof body === "string") {
@@ -2066,7 +2204,7 @@ class Session {
     );
     const elapsed = Date.now() - startTime;
     if (responseHandle < 0 || responseHandle === 0 || responseHandle === 0n) {
-      throw new HTTPCloakError("Request failed");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Request failed"));
     }
     return parseRawResponse(this._lib, responseHandle, elapsed);
   }
@@ -2171,17 +2309,13 @@ class Session {
     else if (json !== null) {
       body = JSON.stringify(json);
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     }
     // Handle form data
     else if (data !== null && typeof data === "object") {
       body = new URLSearchParams(data).toString();
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     }
     // Handle Buffer body (binary payload). base64-encode so NUL bytes and
     // non-UTF-8 sequences survive the cgo C-string round-trip intact.
@@ -2272,17 +2406,13 @@ class Session {
     else if (json !== null) {
       body = JSON.stringify(json);
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     }
     // Handle form data
     else if (data !== null && typeof data === "object") {
       body = new URLSearchParams(data).toString();
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     }
     // Handle Buffer body (binary payload). base64-encode so non-UTF-8 bytes
     // and NUL bytes survive JSON.stringify + the C boundary.
@@ -2856,6 +2986,7 @@ class Session {
     const session = Object.create(Session.prototype);
     session._lib = lib;
     session._handle = handle;
+    session._usesJsCache = false;
     session.headers = {};
     session.auth = null;
 
@@ -2884,6 +3015,7 @@ class Session {
     const session = Object.create(Session.prototype);
     session._lib = lib;
     session._handle = handle;
+    session._usesJsCache = false;
     session.headers = {};
     session.auth = null;
 
@@ -2913,6 +3045,7 @@ class Session {
    *   stream.close();
    */
   getStream(url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "getStream");
     const { params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false } = options;
 
     // Add params to URL
@@ -2920,17 +3053,11 @@ class Session {
       url = addParamsToUrl(url, params);
     }
 
-    // Merge headers
-    let mergedHeaders = { ...this.headers };
-    if (headers) {
-      mergedHeaders = { ...mergedHeaders, ...headers };
-    }
-    if (cookies) {
-      const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-      mergedHeaders["Cookie"] = mergedHeaders["Cookie"]
-        ? `${mergedHeaders["Cookie"]}; ${cookieStr}`
-        : cookieStr;
-    }
+    // Merge headers in any spelling, as the buffered methods do: a spread
+    // kept the session's "Authorization" beside a request's "authorization",
+    // and the transport sends the canonical one.
+    let mergedHeaders = this._mergeHeaders(headers) || {};
+    mergedHeaders = this._applyCookies(mergedHeaders, cookies) || {};
 
     // Build options JSON
     const reqOptions = {};
@@ -2960,7 +3087,7 @@ class Session {
     // Start stream
     const streamHandle = this._lib.httpcloak_stream_get(this._handle, url, optionsJson);
     if (streamHandle < 0) {
-      throw new HTTPCloakError("Failed to start streaming request");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Failed to start streaming request"));
     }
 
     // Get metadata
@@ -2994,6 +3121,7 @@ class Session {
    * @returns {StreamResponse} - Streaming response for chunked reading
    */
   postStream(url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "postStream");
     const { body: bodyOpt, json: jsonBody, form, params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false } = options;
 
     // Add params to URL
@@ -3001,30 +3129,24 @@ class Session {
       url = addParamsToUrl(url, params);
     }
 
-    // Merge headers
-    let mergedHeaders = { ...this.headers };
-    if (headers) {
-      mergedHeaders = { ...mergedHeaders, ...headers };
-    }
+    // Merge headers in any spelling, as the buffered methods do: a spread
+    // kept the session's "Authorization" beside a request's "authorization",
+    // and the transport sends the canonical one.
+    let mergedHeaders = this._mergeHeaders(headers) || {};
 
     // Process body
     let body = null;
     if (jsonBody) {
       body = JSON.stringify(jsonBody);
-      mergedHeaders["Content-Type"] = mergedHeaders["Content-Type"] || "application/json";
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     } else if (form) {
       body = Object.entries(form).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
-      mergedHeaders["Content-Type"] = mergedHeaders["Content-Type"] || "application/x-www-form-urlencoded";
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     } else if (bodyOpt) {
       body = typeof bodyOpt === "string" ? bodyOpt : bodyOpt.toString();
     }
 
-    if (cookies) {
-      const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-      mergedHeaders["Cookie"] = mergedHeaders["Cookie"]
-        ? `${mergedHeaders["Cookie"]}; ${cookieStr}`
-        : cookieStr;
-    }
+    mergedHeaders = this._applyCookies(mergedHeaders, cookies) || {};
 
     // Build options JSON
     const reqOptions = {};
@@ -3054,7 +3176,7 @@ class Session {
     // Start stream
     const streamHandle = this._lib.httpcloak_stream_post(this._handle, url, body, optionsJson);
     if (streamHandle < 0) {
-      throw new HTTPCloakError("Failed to start streaming request");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Failed to start streaming request"));
     }
 
     // Get metadata
@@ -3087,6 +3209,7 @@ class Session {
    * @returns {StreamResponse} - Streaming response for chunked reading
    */
   requestStream(method, url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "requestStream");
     const { body, params, headers, cookies, timeout, allowRedirects = null, disableConditionalCache = false, disableClientHints = false, disableHighEntropyClientHints = false, disableRedirectReferer = false, exactHeaders = null, headerOrder = null } = options;
 
     const exact = normalizeExactHeaders(exactHeaders);
@@ -3097,17 +3220,11 @@ class Session {
       url = addParamsToUrl(url, params);
     }
 
-    // Merge headers
-    let mergedHeaders = { ...this.headers };
-    if (headers) {
-      mergedHeaders = { ...mergedHeaders, ...headers };
-    }
-    if (cookies) {
-      const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-      mergedHeaders["Cookie"] = mergedHeaders["Cookie"]
-        ? `${mergedHeaders["Cookie"]}; ${cookieStr}`
-        : cookieStr;
-    }
+    // Merge headers in any spelling, as the buffered methods do: a spread
+    // kept the session's "Authorization" beside a request's "authorization",
+    // and the transport sends the canonical one.
+    let mergedHeaders = this._mergeHeaders(headers) || {};
+    mergedHeaders = this._applyCookies(mergedHeaders, cookies) || {};
 
     // Build request config
     const requestConfig = {
@@ -3148,7 +3265,7 @@ class Session {
     // Start stream
     const streamHandle = this._lib.httpcloak_stream_request(this._handle, JSON.stringify(requestConfig));
     if (streamHandle < 0) {
-      throw new HTTPCloakError("Failed to start streaming request");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Failed to start streaming request"));
     }
 
     // Get metadata
@@ -3193,6 +3310,7 @@ class Session {
    *   fs.writeFileSync("file.zip", response.body);
    */
   getFast(url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "getFast");
     const { headers = null, params = null, cookies = null, auth = null } = options;
 
     url = addParamsToUrl(url, params);
@@ -3213,8 +3331,8 @@ class Session {
 
     // Get raw response handle
     const responseHandle = this._lib.httpcloak_get_raw(this._handle, url, optionsJson);
-    if (responseHandle === 0 || responseHandle === 0n) {
-      throw new HTTPCloakError("Failed to make request");
+    if (responseHandle === 0 || responseHandle === 0n || responseHandle < 0) {
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Failed to make request"));
     }
 
     // Get body length first (1 FFI call)
@@ -3269,6 +3387,7 @@ class Session {
    *   response.release();
    */
   postFast(url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "postFast");
     let { body = null, headers = null, params = null, cookies = null, auth = null } = options;
 
     url = addParamsToUrl(url, params);
@@ -3299,7 +3418,7 @@ class Session {
     // Use httpcloak_post_raw with binary buffer (no string conversion!)
     const responseHandle = this._lib.httpcloak_post_raw(this._handle, url, body, body.length, optionsJson);
     if (responseHandle === 0 || responseHandle === 0n || responseHandle < 0) {
-      throw new HTTPCloakError("Failed to make POST request");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Failed to make POST request"));
     }
 
     // Get body length first (1 FFI call)
@@ -3360,6 +3479,7 @@ class Session {
    *   response.release();
    */
   requestFast(method, url, options = {}) {
+    refuseIfSessionUsesJsCache(this, "requestFast");
     let { body = null, headers = null, params = null, cookies = null, auth = null, timeout = null } = options;
 
     url = addParamsToUrl(url, params);
@@ -3400,7 +3520,7 @@ class Session {
     );
 
     if (responseHandle === 0 || responseHandle === 0n || responseHandle < 0) {
-      throw new HTTPCloakError("Failed to make request");
+      throw new HTTPCloakError(lastError(this._lib, this._handle, "Failed to make request"));
     }
 
     // Get body length first
@@ -3487,6 +3607,7 @@ class Session {
    * @returns {Promise<Response>}
    */
   async uploadStream(method, url, chunks, options = {}) {
+    refuseIfSessionUsesJsCache(this, "uploadStream");
     const { headers = null, contentType = "application/octet-stream", timeout = null } = options;
     const mergedHeaders = this._mergeHeaders(headers) || {};
     const optsJson = JSON.stringify({
@@ -3550,9 +3671,12 @@ let _defaultSession = null;
 let _defaultConfig = {};
 
 /**
- * Configure defaults for module-level functions
+ * Configure defaults for module-level functions.
+ *
+ * Takes every option a Session takes, plus default headers and auth, and
+ * replaces the default session with one built from them.
  * @param {Object} options - Configuration options
- * @param {string} [options.preset="chrome-146"] - Browser preset
+ * @param {string} [options.preset="chrome-latest"] - Browser preset
  * @param {Object} [options.headers] - Default headers
  * @param {Array} [options.auth] - Default basic auth [username, password]
  * @param {string} [options.proxy] - Proxy URL
@@ -3565,19 +3689,7 @@ let _defaultConfig = {};
  * @param {number[]} [options.retryOnStatus] - Status codes to retry on (only consulted when retry > 0)
  */
 function configure(options = {}) {
-  const {
-    preset = "chrome-146",
-    headers = null,
-    auth = null,
-    proxy = null,
-    timeout = 30,
-    httpVersion = "auto",
-    verify = true,
-    allowRedirects = true,
-    maxRedirects = 10,
-    retry = 0,
-    retryOnStatus = null,
-  } = options;
+  const { headers = null, auth = null, ...sessionOptions } = options;
 
   // Close existing session
   if (_defaultSession) {
@@ -3585,38 +3697,21 @@ function configure(options = {}) {
     _defaultSession = null;
   }
 
-  // Apply auth to headers
-  let finalHeaders = applyAuth(headers, auth) || {};
-
-  // Store config
   _defaultConfig = {
-    preset,
-    proxy,
-    timeout,
-    httpVersion,
-    verify,
-    allowRedirects,
-    maxRedirects,
-    retry,
-    retryOnStatus,
-    headers: finalHeaders,
+    sessionOptions,
+    headers: applyAuth(headers, auth) || {},
   };
+  _defaultSession = _createDefaultSession();
+}
 
-  // Create new session
-  _defaultSession = new Session({
-    preset,
-    proxy,
-    timeout,
-    httpVersion,
-    verify,
-    allowRedirects,
-    maxRedirects,
-    retry,
-    retryOnStatus,
-  });
-  if (Object.keys(finalHeaders).length > 0) {
-    Object.assign(_defaultSession.headers, finalHeaders);
+// The session options pass straight through, so the defaults are Session's own.
+function _createDefaultSession() {
+  const session = new Session(_defaultConfig.sessionOptions || {});
+  const headers = _defaultConfig.headers || {};
+  if (Object.keys(headers).length > 0) {
+    Object.assign(session.headers, headers);
   }
+  return session;
 }
 
 /**
@@ -3624,31 +3719,7 @@ function configure(options = {}) {
  */
 function _getDefaultSession() {
   if (!_defaultSession) {
-    const preset = _defaultConfig.preset || "chrome-146";
-    const proxy = _defaultConfig.proxy || null;
-    const timeout = _defaultConfig.timeout || 30;
-    const httpVersion = _defaultConfig.httpVersion || "auto";
-    const verify = _defaultConfig.verify !== undefined ? _defaultConfig.verify : true;
-    const allowRedirects = _defaultConfig.allowRedirects !== undefined ? _defaultConfig.allowRedirects : true;
-    const maxRedirects = _defaultConfig.maxRedirects || 10;
-    const retry = _defaultConfig.retry !== undefined ? _defaultConfig.retry : 0;
-    const retryOnStatus = _defaultConfig.retryOnStatus || null;
-    const headers = _defaultConfig.headers || {};
-
-    _defaultSession = new Session({
-      preset,
-      proxy,
-      timeout,
-      httpVersion,
-      verify,
-      allowRedirects,
-      maxRedirects,
-      retry,
-      retryOnStatus,
-    });
-    if (Object.keys(headers).length > 0) {
-      Object.assign(_defaultSession.headers, headers);
-    }
+    _defaultSession = _createDefaultSession();
   }
   return _defaultSession;
 }
@@ -3756,22 +3827,24 @@ class LocalProxy {
    * Create and start a local HTTP proxy server.
    * @param {Object} options - Proxy configuration options
    * @param {number} [options.port=0] - Port to listen on (0 = auto-select)
-   * @param {string} [options.preset="chrome-146"] - Browser fingerprint preset
+   * @param {string} [options.preset="chrome-latest"] - Browser fingerprint preset
    * @param {number} [options.timeout=30] - Request timeout in seconds
    * @param {number} [options.maxConnections=1000] - Maximum concurrent connections
    * @param {string} [options.tcpProxy] - Default upstream TCP proxy URL
    * @param {string} [options.udpProxy] - Default upstream UDP proxy URL
    * @param {boolean} [options.tlsOnly=false] - TLS-only mode: skip preset HTTP headers, only apply TLS fingerprint
+   * @param {boolean} [options.verify=true] - Verify the certificates of the sites the proxy connects to (false is for testing)
    */
   constructor(options = {}) {
     const {
       port = 0,
-      preset = "chrome-146",
+      preset = "chrome-latest",
       timeout = 30,
       maxConnections = 1000,
       tcpProxy = null,
       udpProxy = null,
       tlsOnly = false,
+      verify = true,
     } = options;
 
     this._lib = getLib();
@@ -3785,6 +3858,7 @@ class LocalProxy {
     if (tcpProxy) config.tcp_proxy = tcpProxy;
     if (udpProxy) config.udp_proxy = udpProxy;
     if (tlsOnly) config.tls_only = true;
+    if (verify === false) config.verify = false;
 
     const configJson = JSON.stringify(config);
     this._handle = this._lib.httpcloak_local_proxy_start(configJson);
@@ -3928,6 +4002,28 @@ class LocalProxy {
 let _sessionCacheBackend = null;
 let _sessionCacheCallbackPtrs = {};
 
+// Strings the sync-mode get callbacks have handed to native code. The native
+// side copies the result after the callback returns, and when the callback
+// was relayed from a library thread, koffi has already released the memory it
+// converted a returned JS string into by then, so concurrent lookups read each
+// other's values or crash. A Buffer is passed by its own memory instead, so
+// the last RETAINED_CACHE_RESULTS results are kept alive here and the oldest
+// is dropped as each new one arrives.
+const RETAINED_CACHE_RESULTS = 128;
+const _retainedCacheResults = [];
+
+function retainCacheResult(result) {
+  if (!result || typeof result !== 'string') {
+    return result || null;
+  }
+  const buf = Buffer.from(result + '\0', 'utf8');
+  _retainedCacheResults.push(buf);
+  if (_retainedCacheResults.length > RETAINED_CACHE_RESULTS) {
+    _retainedCacheResults.shift();
+  }
+  return buf;
+}
+
 /**
  * Distributed TLS session cache backend for sharing sessions across instances.
  *
@@ -4061,7 +4157,7 @@ class SessionCacheBackend {
           console.warn('SessionCacheBackend: Detected async callback in sync mode. Use async: true option.');
           return null;
         }
-        return result || null;
+        return retainCacheResult(result);
       } catch (e) {
         return null;
       }
@@ -4106,7 +4202,7 @@ class SessionCacheBackend {
           console.warn('SessionCacheBackend: Detected async callback in sync mode. Use async: true option.');
           return null;
         }
-        return result || null;
+        return retainCacheResult(result);
       } catch (e) {
         return null;
       }
@@ -4259,6 +4355,14 @@ class SessionCacheBackend {
  *
  * This is a convenience function that creates and registers a SessionCacheBackend.
  * Supports both synchronous and asynchronous callbacks (auto-detected).
+ *
+ * The callbacks run on the JavaScript thread, so use the async request methods
+ * on sessions created while a cache is configured. On those sessions the
+ * methods that block that thread (the *Sync, stream and fast-path methods,
+ * uploadStream and warmup) would wait on a callback that cannot run until they
+ * return, so they throw an HTTPCloakError instead. A session keeps the cache it
+ * was created with, so clearSessionCache() lifts this only for sessions
+ * created after it.
  *
  * @param {Object} options Cache configuration (same as SessionCacheBackend constructor)
  * @returns {SessionCacheBackend} The registered backend

@@ -302,8 +302,9 @@ session = Session(
 from httpcloak import available_presets
 
 print(available_presets())
-# ['chrome-146', 'chrome-145', 'chrome-144', 'chrome-143', 'chrome-141', 'chrome-133',
-#  'firefox-133', 'safari-18', 'chrome-146-ios', ...]
+# ['chrome-latest', 'chrome-158', 'chrome-158-windows', 'chrome-158-android', 'chrome-157',
+#  ..., 'chrome-155-ios', 'firefox-148', 'safari-18', ...]
+# Desktop and Android Chrome go up to 158 (Android has no 149); iOS Chrome has 143 to 148, 150 to 152, and 155.
 ```
 
 ## Response Object
@@ -558,7 +559,8 @@ proxy = LocalProxy(
     max_connections=1000,# Max concurrent connections
     tcp_proxy=None,      # Default upstream TCP proxy
     udp_proxy=None,      # Default upstream UDP proxy
-    tls_only=False       # TLS-only mode
+    tls_only=False,      # TLS-only mode
+    verify=True          # Check the certificates of the sites it connects to (False for self-signed test servers)
 )
 
 proxy.port           # Actual port number
@@ -570,9 +572,11 @@ proxy.close()        # Stop the proxy
 
 ## Platform Support
 
-- Linux (x64, arm64)
-- macOS (x64, arm64)
-- Windows (x64, arm64)
+- Linux (x64, arm64), glibc 2.17 or later
+- macOS 12 or later (x64, arm64)
+- Windows 10 or later (x64)
+
+Alpine and other musl systems aren't supported yet.
 - Python 3.8+
 
 ## License

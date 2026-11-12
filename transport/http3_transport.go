@@ -162,8 +162,9 @@ func ResetInitialRTT() {}
 // AdditionalTransportParamsForPreset returns per-connection additional QUIC
 // transport params appropriate for the given preset. For Chrome presets that is
 // version_information (0x11) and google_connection_options (0x3128). For
-// non-Chrome presets (e.g. Firefox) it returns nil so these Chrome-specific
-// params are not sent.
+// non-Chrome presets (e.g. Firefox) it returns an empty map so these
+// Chrome-specific params are not sent. A preset whose HTTP/3 hello is a capture
+// sends whichever of the two the capture carries.
 //
 // The ctx/host/port parameters are unused and retained for API compatibility;
 // they previously drove the initial_rtt probe.
@@ -171,6 +172,18 @@ func AdditionalTransportParamsForPreset(preset *fingerprint.Preset, _ context.Co
 	if preset == nil {
 		return nil
 	}
+
+	captured, fromCapture, err := fingerprint.QUICCaptureTransportParameters(preset)
+	if err != nil {
+		// Load refuses a capture this cannot read, so only a preset assembled
+		// in Go gets here, and its hello fails to resolve on the same bytes.
+		// Nothing the capture cannot vouch for is sent.
+		return map[uint64][]byte{}
+	}
+	if fromCapture {
+		return chromeTransportParamsFromCapture(preset, captured)
+	}
+
 	if !presetIsChromeQUIC(preset) {
 		// Empty, NOT nil. quic-go treats a nil additional-parameter map as "fall
 		// back to the process-global set", and MeasureAndSetInitialRTT writes
@@ -181,6 +194,36 @@ func AdditionalTransportParamsForPreset(preset *fingerprint.Preset, _ context.Co
 		return map[uint64][]byte{}
 	}
 	return BuildChromeTransportParamsFor(preset.H3QUICConnectionOptions())
+}
+
+// chromeTransportParamsFromCapture sends each Chrome parameter the captured
+// hello carries, and no other.
+//
+// Presence is read off the capture, but version_information is still built
+// fresh: its GREASE label is drawn per connection, and replaying the captured
+// one would pin it. google_connection_options takes the preset's
+// quic_connection_options when that is set, and the captured tags otherwise,
+// since Chrome's "ORIG" default is a guess the capture has already answered.
+func chromeTransportParamsFromCapture(preset *fingerprint.Preset, captured map[uint64][]byte) map[uint64][]byte {
+	var connectionOptions []string
+	if preset.H3Config != nil && preset.H3Config.QUICConnectionOptions != nil {
+		connectionOptions = *preset.H3Config.QUICConnectionOptions
+	} else {
+		tags := captured[tpGoogleConnectionOptions]
+		connectionOptions = []string{}
+		for len(tags) >= 4 {
+			connectionOptions = append(connectionOptions, string(tags[:4]))
+			tags = tags[4:]
+		}
+	}
+
+	params := BuildChromeTransportParamsFor(connectionOptions)
+	for id := range params {
+		if _, ok := captured[id]; !ok {
+			delete(params, id)
+		}
+	}
+	return params
 }
 
 // presetIsChromeQUIC reports whether a preset impersonates a Chromium-based
@@ -199,6 +242,11 @@ func AdditionalTransportParamsForPreset(preset *fingerprint.Preset, _ context.Co
 // desktop and Android Chrome presets, and something else (or empty) for
 // Firefox, Safari and the WebKit-based iOS Chrome presets, which really do not
 // send these.
+//
+// A preset whose HTTP/3 hello is a capture never asks. Loading a capture clears
+// the identity it replaces, so this would answer from whatever identity was
+// left, and the capture itself says which parameters the client sends; see
+// chromeTransportParamsFromCapture.
 func presetIsChromeQUIC(preset *fingerprint.Preset) bool {
 	if preset.QUICClientHelloID.Client != "" {
 		return preset.QUICClientHelloID.Client == "Chrome"
@@ -269,11 +317,10 @@ type HTTP3Transport struct {
 	// TLS session cache for 0-RTT resumption
 	sessionCache tls.ClientSessionCache
 
-	// Cached ClientHelloSpec for consistent TLS fingerprint
-	// Chrome shuffles TLS extensions once per session, not per connection
+	// Seed spec, built at construction so a dial has something if spec
+	// resolution fails. Dials go through getSpecForHost, which builds a fresh
+	// one per connection; see FreshShuffleSeed for why that matters.
 	cachedClientHelloSpec *utls.ClientHelloSpec
-	// PSK variant of the spec for session resumption (includes pre_shared_key extension)
-	cachedClientHelloSpecPSK *utls.ClientHelloSpec
 
 	// Separate cached spec for inner MASQUE connections (not shared with outer)
 	cachedClientHelloSpecInner *utls.ClientHelloSpec
@@ -283,12 +330,9 @@ type HTTP3Transport struct {
 	// Resolved ClientHelloID (QUIC-specific, or TCP fallback). Used to regenerate
 	// a FRESH ClientHelloSpec per dial. utls ApplyPreset mutates the spec in place
 	// (KeyShares.Data, GREASE), so sharing one cached spec across concurrent QUIC
-	// dials is a data race; each dial gets its own spec generated from this ID +
-	// shuffleSeed, which keeps extension order (and thus JA3/JA4) byte-stable.
+	// dials is a data race; each dial builds its own spec from this ID, with the
+	// extension order redrawn per connection the way Chrome draws it.
 	clientHelloID *utls.ClientHelloID
-
-	// Shuffle seed for TLS and transport parameter ordering (consistent per session)
-	shuffleSeed int64
 
 	// specErr holds why the QUIC hello could not be built, so a dial reports it
 	// instead of connecting with the QUIC stack's default hello.
@@ -298,12 +342,6 @@ type HTTP3Transport struct {
 	// Track requests for timing
 	requestCount int64
 	dialCount    int64 // Number of times dialQUIC was called (new connections)
-	// zeroRTTRejected records hosts that rejected early data. The 0-RTT retry
-	// loop used to recreate the transport and dial again with the SAME session
-	// ticket, so every retry offered 0-RTT and got the same rejection: three
-	// rounds, six dials, several seconds, then a hard failure on a host that
-	// would have answered a plain handshake immediately.
-	zeroRTTRejected map[string]bool
 
 	// lastConn is the most recent connection handed back by any dial path,
 	// kept so Stats can read its handshake state on demand. One pointer,
@@ -329,7 +367,18 @@ type HTTP3Transport struct {
 	udpbaraMu     sync.Mutex      // guards lazy connect of udpbaraTunnel
 	proxyConns    []*proxyQUICConn
 	proxyConnsMu  sync.Mutex
-	quicTransport *quic.Transport // Only used for direct connections
+
+	// Direct connections each get a UDP socket of their own, closed with the
+	// connection; see dialDirect. h3Closed is set by Close so that a dial
+	// racing it cannot open a socket afterwards.
+	liveMu   sync.Mutex
+	sockets  map[*quic.Conn]*directSocket
+	h3Closed bool
+
+	// byOrigin holds every live connection, from any dial path, under the
+	// host:port it was dialed for, so one origin's connections can be ended
+	// without touching the others'. Guarded by liveMu.
+	byOrigin map[string]map[*quic.Conn]struct{}
 
 	// MASQUE proxy support
 	masqueConn *proxy.MASQUEConn
@@ -424,28 +473,38 @@ func (t *HTTP3Transport) SetDisableECH(disable bool) {
 // hasSessionForHost checks if there's a cached TLS session for the given host
 // This is used to determine whether to use PSK spec (for resumption) or regular spec
 func (t *HTTP3Transport) hasSessionForHost(host string) bool {
+	return t.sessionForHost(host) != nil
+}
+
+// sessionForHost returns the cached ticket a dial to host will resume, or nil.
+func (t *HTTP3Transport) sessionForHost(host string) *utls.ClientSessionState {
 	if t.sessionCache == nil {
-		return false
+		return nil
 	}
 	// Session key format is just the server name in TLS 1.3
 	cache, ok := t.sessionCache.(*PersistableSessionCache)
 	if !ok {
-		return false
+		return nil
 	}
-	_, found := cache.Get(host)
-	return found
+	session, found := cache.Get(host)
+	if !found {
+		return nil
+	}
+	return session
 }
 
 // getSpecForHost returns a FRESH ClientHelloSpec for this dial. utls ApplyPreset
 // (and quic-go's GREASE write-back) mutate the spec in place, so handing the same
-// cached spec to concurrent QUIC dials is a data race. We regenerate per call from
-// the stored ClientHelloID + shuffleSeed: the seed makes the extension order (and
-// therefore JA3/JA4) byte-identical every time, while each connection mutates its
-// own private spec. This mirrors the HTTP/2 transport, which is already race-clean.
+// cached spec to concurrent QUIC dials is a data race. We regenerate per call,
+// and the extension order is redrawn each time rather than held for the session,
+// because that is what Chrome does: BoringSSL keeps extension_permutation on
+// SSL_HANDSHAKE, not on SSL_CTX. Holding one order per session made two
+// connections from one session carry a byte-identical order, which is visible
+// without any statistics at all. See fingerprint.FreshShuffleSeed.
 //
-// The PSK variant (which carries the early_data + pre_shared_key extensions) is
-// used only when there is a cached session to resume; Chrome does not send
-// early_data on a fresh connection.
+// The PSK variant (which carries pre_shared_key, and early_data when the ticket
+// allows 0-RTT) is used only when there is a cached session to resume; Chrome
+// does not send early_data on a fresh connection.
 func (t *HTTP3Transport) getSpecForHost(host string) *utls.ClientHelloSpec {
 	spec, err := t.resolveQUICSpec(host)
 	if err != nil {
@@ -466,8 +525,13 @@ func (t *HTTP3Transport) getSpecForHost(host string) *utls.ClientHelloSpec {
 // next time a source cannot be used it is visible rather than inferred from a
 // fingerprint that looks wrong.
 func (t *HTTP3Transport) resolveQUICSpec(host string) (*utls.ClientHelloSpec, error) {
-	wantPSK := t.preset.QUICPSKClientHelloID.Client != "" && t.hasSessionForHost(host)
-	spec, _, err := fingerprint.ResolveQUICClientHelloSpec(t.preset, wantPSK, t.shuffleSeed)
+	ticket := t.sessionForHost(host)
+	wantPSK := fingerprint.HasQUICPSKVariant(t.preset) && ticket != nil
+	spec, _, err := fingerprint.ResolveQUICClientHelloSpec(t.preset, wantPSK, fingerprint.FreshShuffleSeed())
+	if err == nil && wantPSK {
+		// The resuming hello offers early_data only on a ticket that allows it.
+		h3build.DropEarlyDataUnlessAllowed(spec, t.preset, ticket)
+	}
 	return spec, err
 }
 
@@ -507,11 +571,6 @@ func NewHTTP3Transport(preset *fingerprint.Preset, dnsCache *dns.Cache) (*HTTP3T
 
 // NewHTTP3TransportWithTransportConfig creates a new HTTP/3 transport with advanced config
 func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *dns.Cache, config *TransportConfig) (*HTTP3Transport, error) {
-	// Generate shuffle seed for session-consistent ordering
-	var seedBytes [8]byte
-	crand.Read(seedBytes[:])
-	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
-
 	// Create session cache - with optional distributed backend
 	var sessionCache *PersistableSessionCache
 	if config != nil && config.SessionCacheBackend != nil {
@@ -529,7 +588,6 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		preset:         preset,
 		dnsCache:       dnsCache,
 		sessionCache:   sessionCache,
-		shuffleSeed:    shuffleSeed,
 		config:         config,
 		echConfigCache: make(map[string]*echCachedConfig), // Cache for ECH configs (for session resumption)
 	}
@@ -546,25 +604,14 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 	}
 	t.clientHelloID = clientHelloID // stored for fresh-spec-per-dial regeneration
 
-	// Cache the ClientHelloSpec for consistent TLS fingerprint across connections
-	// Chrome shuffles TLS extensions once per session, not per connection
-	// Use the shuffle seed for deterministic ordering
+	// Build the seed spec. Dials do not use it directly; they call
+	// getSpecForHost, which draws a fresh extension order per connection.
 	if clientHelloID != nil {
-		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
+		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, fingerprint.FreshShuffleSeed())
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(spec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyQUICTrustAnchors(&spec.Extensions, preset)
 			t.cachedClientHelloSpec = &spec
-		}
-	}
-
-	// Also cache the PSK spec for session resumption (includes pre_shared_key extension)
-	// Chrome uses a different TLS extension set when resuming with PSK
-	if preset.QUICPSKClientHelloID.Client != "" {
-		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
-			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors)
-			t.cachedClientHelloSpecPSK = &pskSpec
 		}
 	}
 
@@ -586,7 +633,7 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		KeyLogWriter:       keyLogWriter,
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
 	}
 
@@ -607,32 +654,8 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		t.localAddr = config.LocalAddr
 	}
 
-	// Create QUIC transport for direct connections
-	// We need a bound UDP socket for quic.Transport
-	var localUDPAddr *net.UDPAddr
-	if t.localAddr != "" {
-		localUDPAddr = &net.UDPAddr{IP: net.ParseIP(t.localAddr)}
-	} else {
-		localUDPAddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-	}
-	udpConn, err := ListenUDPWithLocalAddr("udp", localUDPAddr, t.localAddr)
-	if err != nil {
-		if t.localAddr != "" {
-			// localAddr is set — retrying with the same IP on "udp6" won't help
-			return nil, fmt.Errorf("failed to create UDP socket for %s: %w", t.localAddr, err)
-		}
-		// Fallback to IPv6 if IPv4 fails (no localAddr — try IPv6zero)
-		localUDPAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
-		udpConn, err = ListenUDPWithLocalAddr("udp6", localUDPAddr, t.localAddr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create UDP socket (IPv4 and IPv6 both failed): %w", err)
-		}
-	}
-	t.quicTransport = &quic.Transport{
-		Conn:                         udpConn,
-		ConnectionIDLength:           t.preset.H3QUICConnectionIDLength(),
-		AllowZeroLengthConnectionIDs: true,
-	}
+	// No socket is opened here: each direct dial opens its own (dialDirect),
+	// so a transport that never dials HTTP/3 holds none.
 
 	// Create HTTP/3 transport with custom dial for DNS caching
 	// http3.Transport handles connection pooling internally
@@ -665,11 +688,6 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		}
 	}
 
-	// Generate shuffle seed for session-consistent ordering
-	var seedBytes [8]byte
-	crand.Read(seedBytes[:])
-	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
-
 	// Create session cache - with optional distributed backend
 	var sessionCache *PersistableSessionCache
 	if config != nil && config.SessionCacheBackend != nil {
@@ -687,7 +705,6 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		preset:         preset,
 		dnsCache:       dnsCache,
 		sessionCache:   sessionCache,
-		shuffleSeed:    shuffleSeed,
 		proxyConfig:    proxyConfig,
 		config:         config,
 		echConfigCache: make(map[string]*echCachedConfig),
@@ -710,20 +727,11 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 
 	// Cache ClientHelloSpec for consistent fingerprint
 	if clientHelloID != nil {
-		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
+		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, fingerprint.FreshShuffleSeed())
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(spec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyQUICTrustAnchors(&spec.Extensions, preset)
 			t.cachedClientHelloSpec = &spec
-		}
-	}
-
-	// Also cache the PSK spec for session resumption (includes pre_shared_key extension)
-	if preset.QUICPSKClientHelloID.Client != "" {
-		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
-			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors)
-			t.cachedClientHelloSpecPSK = &pskSpec
 		}
 	}
 
@@ -745,7 +753,7 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		KeyLogWriter:       keyLogWriter,
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
 	}
 
@@ -767,7 +775,7 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	// bounds the connect by the dial's own context.
 	if proxyConfig != nil && proxyConfig.URL != "" {
 		t.usesUDPProxy = true
-		// Note: quicTransport is NOT created here — each dial creates its own per-connection
+		// Proxied dials create their own per-connection transports.
 	}
 
 	// Build H3 additional settings from preset getters
@@ -789,11 +797,6 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 // MASQUE allows HTTP/3 (QUIC) traffic to be tunneled through an HTTP/3 proxy using
 // the CONNECT-UDP method defined in RFC 9298.
 func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache, proxyConfig *ProxyConfig, config *TransportConfig) (*HTTP3Transport, error) {
-	// Generate shuffle seed for session-consistent ordering
-	var seedBytes [8]byte
-	crand.Read(seedBytes[:])
-	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
-
 	// Create session cache - with optional distributed backend
 	var sessionCache *PersistableSessionCache
 	if config != nil && config.SessionCacheBackend != nil {
@@ -811,7 +814,6 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		preset:         preset,
 		dnsCache:       dnsCache,
 		sessionCache:   sessionCache,
-		shuffleSeed:    shuffleSeed,
 		proxyConfig:    proxyConfig,
 		config:         config,
 		echConfigCache: make(map[string]*echCachedConfig),
@@ -834,34 +836,28 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 
 	// Cache ClientHelloSpec for consistent fingerprint (outer connection to proxy)
 	if clientHelloID != nil {
-		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
+		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, fingerprint.FreshShuffleSeed())
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(spec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyQUICTrustAnchors(&spec.Extensions, preset)
 			t.cachedClientHelloSpec = &spec
 		}
 		// Create separate cached spec for inner connections (not shared with outer)
 		// This ensures JA4 hash is consistent across inner requests
-		innerSpec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
+		innerSpec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, fingerprint.FreshShuffleSeed())
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(innerSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&innerSpec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyQUICTrustAnchors(&innerSpec.Extensions, preset)
 			t.cachedClientHelloSpecInner = &innerSpec
 		}
 	}
 
 	// Also cache PSK specs for session resumption (includes pre_shared_key extension)
 	if preset.QUICPSKClientHelloID.Client != "" {
-		// Outer PSK spec
-		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
-			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors)
-			t.cachedClientHelloSpecPSK = &pskSpec
-		}
 		// Inner PSK spec for MASQUE connections
-		if innerPskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
+		if innerPskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, fingerprint.FreshShuffleSeed()); err == nil {
 			fingerprint.ApplySignatureAlgorithms(innerPskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&innerPskSpec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyQUICTrustAnchors(&innerPskSpec.Extensions, preset)
 			t.cachedClientHelloSpecInnerPSK = &innerPskSpec
 		}
 	}
@@ -884,7 +880,7 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		KeyLogWriter:       keyLogWriter,
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
 	}
 
@@ -965,7 +961,7 @@ func (t *HTTP3Transport) dialQUICWithMASQUE(ctx context.Context, addr string, tl
 	tlsCfgCopy.ServerName = host
 	// Clone() doesn't preserve ClientSessionCache, restore it for session resumption
 	// Only if we have PSK spec to prevent TOCTOU race
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		tlsCfgCopy.ClientSessionCache = t.sessionCache
 	}
 
@@ -990,7 +986,7 @@ func (t *HTTP3Transport) dialQUICWithMASQUE(ctx context.Context, addr string, tl
 	// - TransportParameterOrder: WORKS - Chrome transport param ordering
 
 	// Switch to PSK ClientHelloSpec for resumed connections
-	// If there's a cached session, use PSK spec (includes early_data + pre_shared_key extensions)
+	// With a cached session, use the PSK spec: pre_shared_key, plus early_data when the ticket allows it
 	// This tells utls to actually load and use the cached session for 0-RTT
 	innerSpec := t.getInnerSpecForHost(host)
 
@@ -1124,7 +1120,7 @@ func (t *HTTP3Transport) dialQUICWithProxy(ctx context.Context, addr string, tls
 	// Clone TLS config — ServerName is the actual host (not connectHost)
 	tlsCfgCopy := t.tlsConfig.Clone()
 	tlsCfgCopy.ServerName = host
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		tlsCfgCopy.ClientSessionCache = t.sessionCache
 	}
 
@@ -1153,14 +1149,6 @@ func (t *HTTP3Transport) dialQUICWithProxy(ctx context.Context, addr string, tls
 	}()
 
 	return conn, nil
-}
-
-// raceQUICDial implements Happy Eyeballs-style connection racing (legacy, fetches ECH internally)
-// Tries IPv6 first with a short timeout, then falls back to IPv4 if needed
-func (t *HTTP3Transport) raceQUICDial(ctx context.Context, host string, ipv6Addrs, ipv4Addrs []*net.UDPAddr, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-	// Fetch ECH config (legacy path - used by proxy dial functions)
-	echConfigList := t.getECHConfig(ctx, host)
-	return t.raceQUICDialWithECH(ctx, host, ipv6Addrs, ipv4Addrs, tlsCfg, cfg, echConfigList)
 }
 
 // SetIPv4FirstOverride transiently biases the next Happy-Eyeballs QUIC dials to
@@ -1285,41 +1273,149 @@ func (t *HTTP3Transport) happyEyeballsDialQUIC(ctx context.Context, addrs []*net
 			// ClientHello spec, so concurrent dials never mutate shared state.
 			// The spec matters most: utls rewrites it in place during
 			// ApplyPreset, so a shared one is corrupted by the racing dial.
-			return t.quicTransport.DialEarly(rctx, addrs[idx], tlsCfg, makeConfig())
+			return t.dialDirect(rctx, addrs[idx], tlsCfg, makeConfig())
 		},
 		func(c *quic.Conn) { c.CloseWithError(0, "lost happy-eyeballs race") },
 	)
 }
 
-// dialFirstSuccessful tries each address in order until one succeeds.
-// Per-address timeout prevents a single unresponsive IP from consuming the entire timeout budget.
-func (t *HTTP3Transport) dialFirstSuccessful(ctx context.Context, addrs []*net.UDPAddr, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-	var lastErr error
-	for i, addr := range addrs {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
+// directSocket is the UDP socket behind one direct QUIC connection.
+type directSocket struct {
+	tr   *quic.Transport
+	udp  *net.UDPConn
+	once sync.Once
+}
 
-		// Per-address timeout: divide remaining time evenly, cap at 10s
-		remaining := len(addrs) - i
-		perAddrTimeout := 10 * time.Second
-		if deadline, ok := ctx.Deadline(); ok {
-			budget := time.Until(deadline) / time.Duration(remaining)
-			if budget < perAddrTimeout {
-				perAddrTimeout = budget
-			}
-		}
-		addrCtx, addrCancel := context.WithTimeout(ctx, perAddrTimeout)
-		conn, err := t.quicTransport.DialEarly(addrCtx, addr, tlsCfg, cfg)
-		addrCancel()
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
+// close ends the quic.Transport and then the socket. quic.Transport.Close only
+// closes a socket it created itself, and this one was handed in, so the socket
+// is closed here explicitly. The shared socket this replaced was never closed
+// at all, so every transport that had dialed HTTP/3 kept one open for good.
+func (s *directSocket) close() {
+	s.once.Do(func() {
+		closeWithTimeout(s.tr, 3*time.Second)
+		s.udp.Close()
+	})
+}
+
+// dialDirect dials one direct QUIC connection on a UDP socket of its own.
+//
+// Chromium opens a socket per QUIC session (QuicSessionPool::CreateSessionHelper
+// calls CreateSocket for each one). Every connection here used to share one
+// socket, which broke Chrome presets outright: their connection IDs are
+// zero-length, so a server's packets carry nothing that says which connection
+// they are for, and quic-go, which demultiplexes a socket by connection ID,
+// handed one origin's packets to another origin's connection (#126). With two
+// origins open at once, every request to the second one failed. Sharing also
+// sent every connection of a session from one source port, which a server can
+// link; a browser's come from different ports.
+func (t *HTTP3Transport) dialDirect(ctx context.Context, addr *net.UDPAddr, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+	network, local := "udp4", &net.UDPAddr{IP: net.IPv4zero}
+	if addr.IP.To4() == nil {
+		network, local = "udp6", &net.UDPAddr{IP: net.IPv6zero}
 	}
-	return nil, lastErr
+	if t.localAddr != "" {
+		local = &net.UDPAddr{IP: net.ParseIP(t.localAddr)}
+	}
+	udp, err := ListenUDPWithLocalAddr(network, local, t.localAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create UDP socket: %w", err)
+	}
+	sock := &directSocket{
+		tr: &quic.Transport{
+			Conn:                         udp,
+			ConnectionIDLength:           t.preset.H3QUICConnectionIDLength(),
+			AllowZeroLengthConnectionIDs: true,
+		},
+		udp: udp,
+	}
+	conn, err := sock.tr.DialEarly(ctx, addr, tlsCfg, cfg)
+	if err != nil {
+		sock.close()
+		return nil, err
+	}
+
+	t.liveMu.Lock()
+	if t.h3Closed {
+		t.liveMu.Unlock()
+		conn.CloseWithError(0, "")
+		sock.close()
+		return nil, net.ErrClosed
+	}
+	if t.sockets == nil {
+		t.sockets = make(map[*quic.Conn]*directSocket)
+	}
+	t.sockets[conn] = sock
+	t.liveMu.Unlock()
+
+	// The socket goes with the connection, whoever ends it: the peer, an idle
+	// timeout, a lost Happy Eyeballs race, or closeDirectConns.
+	context.AfterFunc(conn.Context(), func() {
+		t.liveMu.Lock()
+		delete(t.sockets, conn)
+		t.liveMu.Unlock()
+		sock.close()
+	})
+	return conn, nil
+}
+
+// trackOrigin records a live connection under the origin it was dialed for,
+// until it ends.
+func (t *HTTP3Transport) trackOrigin(addr string, conn *quic.Conn) {
+	t.liveMu.Lock()
+	if t.byOrigin == nil {
+		t.byOrigin = make(map[string]map[*quic.Conn]struct{})
+	}
+	if t.byOrigin[addr] == nil {
+		t.byOrigin[addr] = make(map[*quic.Conn]struct{})
+	}
+	t.byOrigin[addr][conn] = struct{}{}
+	t.liveMu.Unlock()
+	context.AfterFunc(conn.Context(), func() {
+		t.liveMu.Lock()
+		delete(t.byOrigin[addr], conn)
+		if len(t.byOrigin[addr]) == 0 {
+			delete(t.byOrigin, addr)
+		}
+		t.liveMu.Unlock()
+	})
+}
+
+// closeOrigin ends every connection to one origin and leaves the rest alone.
+func (t *HTTP3Transport) closeOrigin(addr string) {
+	t.liveMu.Lock()
+	conns := t.byOrigin[addr]
+	delete(t.byOrigin, addr)
+	t.liveMu.Unlock()
+	for conn := range conns {
+		conn.CloseWithError(0, "")
+	}
+}
+
+// originKey is the host:port the http3 transport dials for u, which is also
+// the key trackOrigin records connections under.
+func originKey(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	return net.JoinHostPort(u.Hostname(), "443")
+}
+
+// closeDirectConns ends every direct connection and closes its socket. The
+// http3 pool can drop a connection without closing it, and keep-alive stops
+// such a connection from ever idling out, so this is the only thing that ends
+// those. With final set, later dials are refused.
+func (t *HTTP3Transport) closeDirectConns(final bool) {
+	t.liveMu.Lock()
+	if final {
+		t.h3Closed = true
+	}
+	sockets := t.sockets
+	t.sockets = nil
+	t.liveMu.Unlock()
+	for conn, sock := range sockets {
+		conn.CloseWithError(0, "")
+		sock.close()
+	}
 }
 
 // buildQUICConfig builds a QUIC config from preset getters.
@@ -1364,26 +1460,12 @@ func (t *HTTP3Transport) recordHandshakeState(
 		return nil
 	}
 	return func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-		// A host that rejected early data once will reject it again. Dropping
-		// the session cache for that dial forces a full handshake, which is the
-		// only thing that makes the retry different from the attempt that just
-		// failed.
-		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
-			t.mu.RLock()
-			rejected := t.zeroRTTRejected[host]
-			t.mu.RUnlock()
-			if rejected && tlsCfg != nil && tlsCfg.ClientSessionCache != nil {
-				noResume := tlsCfg.Clone()
-				noResume.ClientSessionCache = nil
-				tlsCfg = noResume
-			}
-		}
-
 		conn, err := dial(ctx, addr, tlsCfg, cfg)
 		if err == nil && conn != nil {
 			t.mu.Lock()
 			t.lastConn = conn
 			t.mu.Unlock()
+			t.trackOrigin(addr, conn)
 		}
 		return conn, err
 	}
@@ -1399,6 +1481,9 @@ func (t *HTTP3Transport) buildHTTP3Transport(dialFunc func(ctx context.Context, 
 		AdditionalSettings:     additionalSettings,
 		MaxResponseHeaderBytes: int(t.preset.H3MaxResponseHeaderBytes()),
 		SendGreaseFrames:       t.preset.H3SendGreaseFrames(),
+		// Never add "accept-encoding: gzip" on the caller's behalf; see the
+		// same setting in internal/h2build.
+		DisableCompression: true,
 	}
 }
 
@@ -1518,7 +1603,7 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 	tlsCfgCopy.ServerName = host
 	// Clone() doesn't preserve ClientSessionCache, restore it for session resumption
 	// Only if we have PSK spec to prevent TOCTOU race
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		tlsCfgCopy.ClientSessionCache = t.sessionCache
 	}
 
@@ -1529,7 +1614,7 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 	}
 
 	// Switch to PSK ClientHelloSpec for resumed connections
-	// If there's a cached session, use PSK spec (includes early_data + pre_shared_key extensions)
+	// With a cached session, use the PSK spec: pre_shared_key, plus early_data when the ticket allows it
 	// This matches real Chrome's behavior for 0-RTT resumption
 	// Note: The PSK spec (HelloChrome_143_QUIC_PSK) has the pre_shared_key extension which
 	// tells utls to actually load and use the cached session for 0-RTT
@@ -1550,29 +1635,32 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	dialsBefore := t.dialCount
 	t.mu.Unlock()
 
-	// Use ordered headers if available (HTTP/3 header order matters for fingerprinting)
-	// Skip if in TLS-only mode (headers handled by applyPresetHeaders which respects tlsOnly)
-	tlsOnly := t.config != nil && t.config.TLSOnly
-	if !tlsOnly {
-		if len(t.preset.HeaderOrder) > 0 {
-			// Apply headers in the specified order
-			for _, hp := range t.preset.HeaderOrder {
-				if req.Header.Get(hp.Key) == "" {
-					req.Header.Set(hp.Key, hp.Value)
-				}
-			}
-		} else {
-			// Fallback to unordered headers map
-			for key, value := range t.preset.Headers {
-				if req.Header.Get(key) == "" {
-					req.Header.Set(key, value)
-				}
+	// No preset header is filled in here, as none is on HTTP/1.1 or HTTP/2.
+	// Both callers, Transport and client.Client, hand over a request whose
+	// headers they have already built, and a header missing from it was taken
+	// off on purpose: a fetch drops Sec-Fetch-User and
+	// Upgrade-Insecure-Requests, DisableClientHints drops the sec-ch-ua trio,
+	// TLS-only drops all of them. This used to put back every preset header
+	// the request did not carry, with the preset's navigation value, so on
+	// HTTP/3 alone a fetch went out with navigation headers and a TLS-only
+	// request with the whole set. Only a transport-wide TLS-only setting
+	// stopped it, never a per-request one.
+	//
+	// User-Agent is the one exception. With no user-agent field at all,
+	// quic-go writes its own "quic-go HTTP/3", where HTTP/2 sends the
+	// preset's, so an exact-headers request without one would name the
+	// library. TLS-only requests are left alone: the pipeline gives them an
+	// empty User-Agent precisely so nothing is sent, and that key is present.
+	if t.config == nil || !t.config.TLSOnly {
+		hasUA := false
+		for key := range req.Header {
+			if strings.EqualFold(key, "User-Agent") {
+				hasUA = true
+				break
 			}
 		}
-
-		// Set User-Agent if not set
-		if req.Header.Get("User-Agent") == "" {
-			req.Header.Set("User-Agent", t.preset.UserAgent)
+		if !hasUA {
+			req.Header["User-Agent"] = []string{t.preset.UserAgent}
 		}
 	}
 
@@ -1624,7 +1712,18 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	transport := t.transport
 	t.mu.RUnlock()
 
-	// Retry up to 3 times on 0-RTT rejection (can happen multiple times after Refresh)
+	// Retry on 0-RTT rejection. The rejected connection cannot carry the
+	// request, so it is ended along with the ticket that offered the early
+	// data, and the retry dials a full handshake that picks up a fresh ticket.
+	//
+	// This used to close and rebuild the whole transport, which ended every
+	// other origin's connections and failed their requests in flight; and the
+	// host was marked rather than its ticket dropped, but every dial path put
+	// the session cache back and still chose the resuming hello, so each retry
+	// offered 0-RTT and was rejected again until the request failed (#127).
+	// Chrome goes further still and resends on the same connection once its
+	// handshake completes; that would need the HTTP/3 layer to reopen its
+	// control streams after the rejection, which it cannot do today.
 	var resp *http.Response
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -1632,27 +1731,11 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err == nil || !is0RTTRejectedError(err) {
 			break
 		}
-		// 0-RTT rejected. Mark the host BEFORE recreating, so the next dial
-		// suppresses the session cache and does a full handshake. Without this
-		// the retry repeats the identical offer and gets the identical
-		// rejection, which is what turned a recoverable stall into a hard
-		// failure after six dials.
-		if host := hostOnly(req.URL.Host); host != "" {
-			t.mu.Lock()
-			if t.zeroRTTRejected == nil {
-				t.zeroRTTRejected = make(map[string]bool)
-			}
-			t.zeroRTTRejected[host] = true
-			t.mu.Unlock()
+		origin := originKey(req.URL)
+		if t.sessionCache != nil {
+			t.sessionCache.Put(hostOnly(origin), nil)
 		}
-		// close unusable connection and recreate transport
-		// Use timeout to prevent blocking if QUIC drain takes too long
-		closeWithTimeout(transport, 3*time.Second)
-		t.recreateTransport()
-		// Re-read transport pointer after recreate
-		t.mu.RLock()
-		transport = t.transport
-		t.mu.RUnlock()
+		t.closeOrigin(origin)
 	}
 
 	// Check if a new connection was created during this request
@@ -1740,9 +1823,7 @@ func (t *HTTP3Transport) Close() error {
 	// Use timeout for QUIC closes to prevent blocking on graceful drain
 	closeWithTimeout(transport, 3*time.Second)
 
-	if t.quicTransport != nil {
-		closeWithTimeout(t.quicTransport, 3*time.Second)
-	}
+	t.closeDirectConns(true)
 
 	// Close udpbara tunnel (if it was ever connected) and all proxy QUIC
 	// connections. Guard the tunnel handle with udpbaraMu since it is connected
@@ -1785,33 +1866,9 @@ func (t *HTTP3Transport) Refresh() error {
 		closeWithTimeout(t.transport, 3*time.Second)
 	}
 
-	// Close and recreate quicTransport if it exists (for direct connections only)
-	if t.quicTransport != nil && !t.usesUDPProxy && t.masqueConn == nil {
-		closeWithTimeout(t.quicTransport, 3*time.Second)
-		// Create new UDP socket with localAddr binding if configured
-		var localUDPAddr *net.UDPAddr
-		if t.localAddr != "" {
-			localUDPAddr = &net.UDPAddr{IP: net.ParseIP(t.localAddr)}
-		} else {
-			localUDPAddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-		}
-		udpConn, err := ListenUDPWithLocalAddr("udp", localUDPAddr, t.localAddr)
-		if err != nil {
-			if t.localAddr != "" {
-				return fmt.Errorf("failed to create UDP socket for %s: %w", t.localAddr, err)
-			}
-			localUDPAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
-			udpConn, err = ListenUDPWithLocalAddr("udp6", localUDPAddr, t.localAddr)
-			if err != nil {
-				return fmt.Errorf("failed to create UDP socket (IPv4 and IPv6 both failed): %w", err)
-			}
-		}
-		t.quicTransport = &quic.Transport{
-			Conn:                         udpConn,
-			ConnectionIDLength:           t.preset.H3QUICConnectionIDLength(),
-			AllowZeroLengthConnectionIDs: true,
-		}
-	}
+	// End every direct connection and its socket, including any the http3
+	// pool has already let go of without closing.
+	t.closeDirectConns(false)
 
 	// Close old proxy QUIC connections; tunnel stays alive for new dials.
 	// Keyed off usesUDPProxy (immutable) so it is race-free even if the tunnel
@@ -1956,31 +2013,6 @@ func boundedECHAttempt(ctx context.Context) (context.Context, context.CancelFunc
 		budget = echAttemptMaxBudget
 	}
 	return context.WithTimeout(ctx, budget)
-}
-
-// recreateTransport recreates the HTTP/3 transport after 0-RTT rejection
-
-// recreateTransport recreates the HTTP/3 transport after 0-RTT rejection
-// This is called from RoundTrip when the server rejects early data
-func (t *HTTP3Transport) recreateTransport() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Build additional settings from preset getters
-	additionalSettings := t.buildH3AdditionalSettings()
-
-	// Determine which dial function to use
-	var dialFunc func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error)
-	if t.masqueConn != nil {
-		dialFunc = t.dialQUICWithMASQUE
-	} else if t.usesUDPProxy {
-		dialFunc = t.dialQUICWithProxy
-	} else {
-		dialFunc = t.dialQUIC
-	}
-
-	// Recreate the transport
-	t.transport = t.buildHTTP3Transport(dialFunc, additionalSettings)
 }
 
 // GetSessionCache returns the TLS session cache

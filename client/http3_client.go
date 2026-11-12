@@ -2,12 +2,11 @@ package client
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	http "github.com/sardanioss/http"
+	"github.com/sardanioss/httpcloak/internal/respheader"
 	"io"
 	"net/url"
 	"strings"
@@ -16,6 +15,8 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"github.com/sardanioss/httpcloak/fingerprint"
+	"github.com/sardanioss/httpcloak/internal/compress"
+	"github.com/sardanioss/httpcloak/internal/gunzip"
 	"github.com/sardanioss/httpcloak/pool"
 	"github.com/sardanioss/httpcloak/protocol"
 )
@@ -204,7 +205,7 @@ func (c *HTTP3Client) Do(ctx context.Context, req *Request) (*Response, error) {
 	}
 
 	// Decompress if needed
-	contentEncoding := resp.Header.Get("Content-Encoding")
+	contentEncoding := respheader.ContentEncoding(resp.Header)
 	body, err = decompressHTTP3(body, contentEncoding)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress response: %w", err)
@@ -273,7 +274,7 @@ func decompressHTTP3(data []byte, encoding string) ([]byte, error) {
 		return io.ReadAll(reader)
 
 	case "gzip":
-		return decompressGzip(data)
+		return gunzip.Bytes(data)
 
 	case "zstd":
 		decoder, err := zstd.NewReader(bytes.NewReader(data))
@@ -284,9 +285,8 @@ func decompressHTTP3(data []byte, encoding string) ([]byte, error) {
 		return io.ReadAll(decoder)
 
 	case "deflate":
-		reader := flate.NewReader(bytes.NewReader(data))
-		defer reader.Close()
-		return io.ReadAll(reader)
+		// zlib-framed (RFC 9110) or raw, decided the way Chrome decides.
+		return compress.InflateDeflate(data)
 
 	case "", "identity":
 		return data, nil
@@ -294,14 +294,4 @@ func decompressHTTP3(data []byte, encoding string) ([]byte, error) {
 	default:
 		return data, nil
 	}
-}
-
-// decompressGzip decompresses gzip data
-func decompressGzip(data []byte) ([]byte, error) {
-	reader, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	return io.ReadAll(reader)
 }

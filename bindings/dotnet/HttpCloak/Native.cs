@@ -12,6 +12,66 @@ internal static class Native
     static Native()
     {
         NativeLibrary.SetDllImportResolver(typeof(Native).Assembly, DllImportResolver);
+        RestoreActivationSignalStack();
+    }
+
+    // The Go runtime in a c-shared library adds SA_ONSTACK to every signal
+    // handler that already exists when it starts. For the CoreCLR activation
+    // signal (SIGRTMIN, used to suspend threads for a GC) that is fatal: the
+    // handler's call chain is deep enough to overflow the small alternate
+    // signal stack once it is moved there, and the kernel then kills the
+    // process with a bare SIGSEGV (exit 139, no Go or .NET output). The
+    // runtime sends this signal to its own threads while they run managed
+    // code, not to threads it knows are in native code, so giving the handler
+    // back its original flags restores the behaviour CoreCLR expects. What
+    // remains is a narrow window: a signal sent just as a thread leaves managed
+    // code for Go would run the handler on the Go stack, which Go's SA_ONSTACK
+    // rule exists to avoid. That window is far smaller than the certain crash
+    // this removes. See GitHub issue #89.
+    private static unsafe void RestoreActivationSignalStack()
+    {
+        // The struct offsets below are glibc's 64-bit layout; there is no
+        // 32-bit Linux build of the library to need another.
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux) || IntPtr.Size != 8)
+            return;
+
+        try
+        {
+            // Any export blocks until the Go runtime has finished starting,
+            // and that includes installing its signal handlers. Stripping the
+            // flag before that point would be undone.
+            FreeString(Version());
+
+            if (!NativeLibrary.TryLoad("libc.so.6", out IntPtr libc))
+                return;
+            if (!NativeLibrary.TryGetExport(libc, "sigaction", out IntPtr sigactionPtr) ||
+                !NativeLibrary.TryGetExport(libc, "__libc_current_sigrtmin", out IntPtr sigrtminPtr))
+                return;
+
+            var sigaction = (delegate* unmanaged<int, byte*, byte*, int>)sigactionPtr;
+            var sigrtmin = (delegate* unmanaged<int>)sigrtminPtr;
+
+            // glibc struct sigaction (generic layout, verified on x64; arm64
+            // uses the same layout): handler (8 bytes), sa_mask (128 bytes),
+            // then int sa_flags at offset 136.
+            const int SaFlagsOffset = 136;
+            const int SA_ONSTACK = 0x08000000;
+            byte* act = stackalloc byte[256];
+            int sig = sigrtmin();
+            if (sigaction(sig, null, act) != 0)
+                return;
+            if (*(IntPtr*)act == IntPtr.Zero || *(IntPtr*)act == (IntPtr)1) // SIG_DFL / SIG_IGN
+                return;
+            int flags = *(int*)(act + SaFlagsOffset);
+            if ((flags & SA_ONSTACK) == 0)
+                return;
+            *(int*)(act + SaFlagsOffset) = flags & ~SA_ONSTACK;
+            sigaction(sig, act, null);
+        }
+        catch
+        {
+            // Best effort. Never let this break loading the library.
+        }
     }
 
     private static IntPtr DllImportResolver(string libraryName, System.Reflection.Assembly assembly, DllImportSearchPath? searchPath)
@@ -19,25 +79,67 @@ internal static class Native
         if (libraryName != LibraryName)
             return IntPtr.Zero;
 
-        string? libPath = GetNativeLibraryPath();
-        if (libPath != null && NativeLibrary.TryLoad(libPath, out IntPtr handle))
-            return handle;
+        bool windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        string? libPath = GetNativeLibraryPath(out string? libName, out string[] probed);
 
-        // Fallback to default resolution
-        return IntPtr.Zero;
+        if (libPath != null)
+        {
+            try
+            {
+                return NativeLibrary.Load(libPath);
+            }
+            catch (Exception e) when (e is DllNotFoundException || e is BadImageFormatException)
+            {
+                // The bundled library is there but will not load, usually a
+                // missing dependency or the wrong CPU. Off Windows, a build of
+                // the caller's own on the default search path (LD_LIBRARY_PATH,
+                // /usr/lib) still gets its chance, as it always had.
+                if (!windows && NativeLibrary.TryLoad(libraryName, assembly, searchPath, out IntPtr fallback))
+                    return fallback;
+                throw new DllNotFoundException(
+                    $"httpcloak: found {libPath} but could not load it: {e.Message.TrimEnd()}. " +
+                    "Set HTTPCLOAK_LIB_PATH to a working build to use that instead.", e);
+            }
+        }
+
+        // Nothing bundled for this platform. Off Windows the default search is
+        // a real chance: the caller may have installed their own build. On
+        // Windows it is not. File names there are case-insensitive, so the
+        // default search for "httpcloak" finds this managed HttpCloak.dll, and
+        // the failure surfaces as a baffling "Unable to find an entry point
+        // named 'httpcloak_session_new'" (#131). Say what is missing instead.
+        if (!windows)
+            return IntPtr.Zero;
+        string what = libName ?? $"a library for {RuntimeInformation.ProcessArchitecture}";
+        throw new DllNotFoundException(
+            $"httpcloak: no native library {what} next to the application (looked in: {string.Join(", ", probed)}). " +
+            "Reinstall the HttpCloak package for this platform, or set HTTPCLOAK_LIB_PATH to the library.");
     }
 
-    private static string? GetNativeLibraryPath()
+    private static string? GetNativeLibraryPath(out string? libName, out string[] probed)
     {
-        string arch = RuntimeInformation.ProcessArchitecture switch
+        probed = Array.Empty<string>();
+        libName = null;
+
+        // Only the CPUs a library is built for. Anything else used to be
+        // mapped to x64, which can never load in that process.
+        string? arch = RuntimeInformation.ProcessArchitecture switch
         {
             Architecture.X64 => "x64",
             Architecture.Arm64 => "arm64",
-            _ => "x64"
+            _ => null
         };
 
+        string? overridePath = Environment.GetEnvironmentVariable("HTTPCLOAK_LIB_PATH");
+        if (arch == null)
+        {
+            // A caller-supplied build is still honoured on any CPU.
+            if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath))
+                return overridePath;
+            return null;
+        }
+
         string rid;
-        string libName;
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -70,7 +172,6 @@ internal static class Native
         // under the usual name. A value that resolves to neither is ignored
         // rather than fatal, so a stale variable degrades to the normal search
         // instead of taking the process down.
-        string? overridePath = Environment.GetEnvironmentVariable("HTTPCLOAK_LIB_PATH");
         if (!string.IsNullOrWhiteSpace(overridePath))
         {
             if (File.Exists(overridePath))
@@ -80,16 +181,27 @@ internal static class Native
                 return inDir;
         }
 
-        // Try different locations
-        string assemblyDir = Path.GetDirectoryName(typeof(Native).Assembly.Location) ?? ".";
-        string[] searchPaths =
-        {
-            Path.Combine(assemblyDir, "runtimes", rid, "native", libName),
-            Path.Combine(assemblyDir, libName),
-            Path.Combine(assemblyDir, "native", libName),
-        };
+        // Look beside the assembly and beside the app. In a single-file app
+        // Assembly.Location is empty, so the app's own directory is the only
+        // anchor; without it the search ran relative to the working
+        // directory and failed for a service started anywhere else.
+        var dirs = new List<string>();
+        string location = typeof(Native).Assembly.Location;
+        if (!string.IsNullOrEmpty(location) && Path.GetDirectoryName(location) is string assemblyDir)
+            dirs.Add(assemblyDir);
+        if (!string.IsNullOrEmpty(AppContext.BaseDirectory) && !dirs.Contains(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar)))
+            dirs.Add(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar));
 
-        foreach (string path in searchPaths)
+        var paths = new List<string>();
+        foreach (string dir in dirs)
+        {
+            paths.Add(Path.Combine(dir, "runtimes", rid, "native", libName));
+            paths.Add(Path.Combine(dir, libName));
+            paths.Add(Path.Combine(dir, "native", libName));
+        }
+        probed = paths.ToArray();
+
+        foreach (string path in paths)
         {
             if (File.Exists(path))
                 return path;
@@ -257,6 +369,12 @@ internal static class Native
 
     [DllImport(LibraryName, EntryPoint = "httpcloak_stream_read", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr StreamRead(long streamHandle, long bufferSize);
+
+    [DllImport(LibraryName, EntryPoint = "httpcloak_stream_trailer", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr StreamTrailer(long streamHandle);
+
+    [DllImport(LibraryName, EntryPoint = "httpcloak_last_error", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr LastError(long sessionHandle);
 
     [DllImport(LibraryName, EntryPoint = "httpcloak_stream_close", CallingConvention = CallingConvention.Cdecl)]
     public static extern void StreamClose(long streamHandle);

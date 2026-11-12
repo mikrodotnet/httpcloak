@@ -1,10 +1,14 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
+
+	"github.com/sardanioss/http/httptrace"
 
 	utls "github.com/sardanioss/utls"
 )
@@ -44,6 +48,7 @@ var (
 
 // ALPNMismatchError is returned when ALPN negotiates a different protocol than expected.
 // It carries the TLS connection so it can be reused for the negotiated protocol.
+// Transport.Do and Transport.DoStream close it before returning a terminal error.
 type ALPNMismatchError struct {
 	Expected   string      // Expected protocol (e.g., "h2")
 	Negotiated string      // Actually negotiated protocol (e.g., "http/1.1")
@@ -58,6 +63,16 @@ func (e *ALPNMismatchError) Error() string {
 
 func (e *ALPNMismatchError) Unwrap() error {
 	return ErrALPNMismatch
+}
+
+// closeUnusedALPNConn releases an unpooled TLS connection once protocol
+// selection has finished and no fallback will consume it. Keep this at the
+// public request boundary: buffered automatic fallback reuses the connection.
+func closeUnusedALPNConn(err error) {
+	var mismatch *ALPNMismatchError
+	if errors.As(err, &mismatch) && mismatch.TLSConn != nil {
+		mismatch.TLSConn.Close()
+	}
 }
 
 // TransportError provides detailed error information
@@ -201,6 +216,58 @@ func NewRequestError(op, host, port, protocol string, cause error) *TransportErr
 	}
 }
 
+// requestNotSentError marks a failure that happened before any part of the
+// request reached the server: no connection could be had for it. Only such a
+// failure is safe to retry on another protocol whatever the method and body;
+// once a request may have been sent, resending it can repeat a payment or
+// send a body that was already consumed.
+type requestNotSentError struct{ err error }
+
+func (e *requestNotSentError) Error() string { return e.err.Error() }
+func (e *requestNotSentError) Unwrap() error { return e.err }
+
+func markNotSent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &requestNotSentError{err: err}
+}
+
+// withH3SendTrace returns ctx with a trace that records whether the HTTP/3
+// layer handed the request to a connection. It does that only once a dial has
+// returned one, so a request that failed without it, on a failed dial or a
+// deadline that ran out while dialing, sent nothing and may go out over HTTP/2.
+// The HTTP/2 side learns the same from its pool directly.
+func withH3SendTrace(ctx context.Context) (context.Context, *atomic.Bool) {
+	gotConn := new(atomic.Bool)
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { gotConn.Store(true) },
+	}), gotConn
+}
+
+// h3NotSent marks err as not sent when the HTTP/3 attempt never had a
+// connection to send it on.
+func h3NotSent(err error, gotConn *atomic.Bool) error {
+	if gotConn.Load() {
+		return err
+	}
+	return markNotSent(err)
+}
+
+// errHTTP3Disabled answers a request routed to HTTP/3 after HTTP/3 was turned
+// off, which a request already past the routing decision can still be. Nothing
+// was sent, so auto mode may send it again on HTTP/2.
+func errHTTP3Disabled(host, port string) error {
+	return markNotSent(NewProtocolError(host, port, "h3", errors.New("HTTP/3 is disabled on this transport")))
+}
+
+// requestNotSent reports whether err says the request never reached the
+// server.
+func requestNotSent(err error) bool {
+	var ns *requestNotSentError
+	return errors.As(err, &ns)
+}
+
 // WrapError wraps an error with transport context
 func WrapError(op, host, port, protocol string, cause error) error {
 	if cause == nil {
@@ -213,9 +280,14 @@ func WrapError(op, host, port, protocol string, cause error) error {
 		return cause
 	}
 
-	// Categorize the error
-	category := categorizeError(cause)
-	retryable := isRetryableError(cause)
+	// Categorize the error. The not-sent marker carries no meaning of its own
+	// and the checks below look at concrete types, so look through it.
+	inner := cause
+	if ns, ok := cause.(*requestNotSentError); ok {
+		inner = ns.err
+	}
+	category := categorizeError(inner)
+	retryable := isRetryableError(inner)
 
 	return &TransportError{
 		Op:        op,

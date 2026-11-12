@@ -2,6 +2,7 @@ package fingerprint
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -56,7 +57,11 @@ func flattenToSpec(p *Preset) (*PresetSpec, error) {
 
 	spec.Headers = flattenHeaders(p)
 	spec.HTTP2 = flattenHTTP2(p)
-	if p.SupportHTTP3 {
+	// A preset can carry an HTTP/3 profile without advertising HTTP/3 by
+	// default (safari-17-ios does), and a session forced onto HTTP/3 still
+	// uses it. Gating the export on SupportHTTP3 alone dropped that profile,
+	// so the described preset loaded back with Chrome's QUIC settings.
+	if p.SupportHTTP3 || p.H3Config != nil {
 		spec.HTTP3 = flattenHTTP3(p)
 	}
 	if tcp := flattenTCP(p); tcp != nil {
@@ -74,6 +79,32 @@ func flattenToSpec(p *Preset) (*PresetSpec, error) {
 // never both, matching the BuildPreset mutual-exclusivity rule.
 func flattenTLS(p *Preset) (*TLSSpec, error) {
 	out := &TLSSpec{}
+
+	if len(p.RawQUICClientHello) > 0 {
+		out.RawQUICClientHello = base64.StdEncoding.EncodeToString(p.RawQUICClientHello)
+		if len(p.RawQUICPSKClientHello) > 0 {
+			out.RawQUICPSKClientHello = base64.StdEncoding.EncodeToString(p.RawQUICPSKClientHello)
+		}
+	}
+	if len(p.RawClientHello) > 0 {
+		out.RawClientHello = base64.StdEncoding.EncodeToString(p.RawClientHello)
+		if len(p.RawPSKClientHello) > 0 {
+			out.RawPSKClientHello = base64.StdEncoding.EncodeToString(p.RawPSKClientHello)
+		}
+	}
+	if out.RawClientHello != "" || out.RawQUICClientHello != "" {
+		if p.RawBluntMimicry {
+			out.AllowBluntMimicry = &p.RawBluntMimicry
+		}
+		if p.RawPermuteExtensions {
+			out.RawPermuteExtensions = &p.RawPermuteExtensions
+		}
+	}
+	// A TCP capture is the whole TCP fingerprint and applyTLS reads nothing
+	// else from a block that carries one.
+	if out.RawClientHello != "" {
+		return out, nil
+	}
 
 	if p.JA3 != "" {
 		out.JA3 = p.JA3
@@ -142,7 +173,12 @@ func flattenTLS(p *Preset) (*TLSSpec, error) {
 		}
 	}
 
-	if out.ClientHello == "" && out.JA3 == "" {
+	if p.QUICTrustAnchorShuffle {
+		v := true
+		out.QUICTrustAnchorsShuffle = &v
+	}
+
+	if out.ClientHello == "" && out.JA3 == "" && out.RawQUICClientHello == "" {
 		// Preset has no TLS configuration at all. Drop the TLS section.
 		return nil, nil
 	}
@@ -205,6 +241,10 @@ func flattenHeaders(p *Preset) *HeaderSpec {
 			out.Order[i] = HeaderPairSpec{Key: hp.Key, Value: hp.Value}
 		}
 	}
+	// Only when set: an empty value means the pre-155 default, and writing that
+	// default out would pin it on a described preset that should keep
+	// following ResolveImageAccept.
+	out.ImageAccept = p.ImageAccept
 	return out
 }
 
@@ -304,9 +344,21 @@ func flattenHTTP2(p *Preset) *HTTP2Spec {
 				Urgency:     rp.Urgency,
 				Incremental: rp.Incremental,
 				EmitHeader:  rp.EmitHeader,
+				Weight:      rp.Weight,
 			}
 		}
+		// The model only means anything alongside a table, and exporting the
+		// effective one keeps a describe -> load copy on the same model even
+		// if the derivation changes later.
+		model := p.H2PriorityModel()
+		out.PriorityModel = &model
 	}
+
+	// Exported for every preset, table or not: a static priority header in
+	// the preset's header block is stripped on HTTP/1.1 by the same rule, and
+	// the derivation partly reads the name, which a loaded copy may change.
+	h1 := p.SendsPriorityOverHTTP1()
+	out.PriorityOverHTTP1 = &h1
 
 	return out
 }

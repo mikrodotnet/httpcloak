@@ -396,8 +396,9 @@ foreach (var preset in presets)
 {
     Console.WriteLine(preset);
 }
-// chrome-146, chrome-145, chrome-144, chrome-143, chrome-141, chrome-133,
-// firefox-133, safari-18, chrome-146-ios, ...
+// chrome-latest, chrome-158, chrome-158-windows, chrome-158-android, chrome-157,
+// ..., chrome-155-ios, firefox-148, safari-18, ...
+// Desktop and Android Chrome go up to 158 (Android has no 149); iOS Chrome has 143 to 148, 150 to 152, and 155.
 ```
 
 ## Error Handling
@@ -561,7 +562,8 @@ var proxy = new LocalProxy(
     maxConnections: 1000,  // Max concurrent connections
     tcpProxy: null,        // Default upstream TCP proxy
     udpProxy: null,        // Default upstream UDP proxy
-    tlsOnly: false         // TLS-only mode
+    tlsOnly: false,        // TLS-only mode
+    verify: true           // Check the certificates of the sites it connects to (false for self-signed test servers)
 );
 
 proxy.Port;           // Actual port number
@@ -578,9 +580,11 @@ proxy.Dispose();      // Stop the proxy
 
 ## Platform Support
 
-- Linux (x64, arm64)
-- macOS (x64, arm64)
-- Windows (x64, arm64)
+- Linux (x64, arm64), glibc 2.17 or later
+- macOS 12 or later (x64, arm64)
+- Windows 10 or later (x64)
+
+Alpine and other musl systems aren't supported yet.
 - .NET 6.0, 7.0, 8.0, 9.0, 10.0+
 
 ## License

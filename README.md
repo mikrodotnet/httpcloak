@@ -114,7 +114,10 @@ pip install httpcloak        # Python
 npm install httpcloak        # Node.js
 go get github.com/sardanioss/httpcloak   # Go
 dotnet add package HttpCloak # C#
+# Android (Kotlin): build the AAR from bindings/android, see bindings/android/README.md
 ```
+
+The Python, Node.js and .NET packages ship a prebuilt native library for Windows 10 and later (x64), macOS 12 and later (Intel and Apple Silicon), and Linux on x64 and arm64 with glibc 2.17 or later. Alpine and other musl systems aren't supported yet (#69). The Go module builds from source wherever Go and cgo do.
 
 ---
 
@@ -591,6 +594,25 @@ client := client.NewClient("chrome-latest",
 )
 ```
 
+### HTTP/2 connection age (Go Session)
+
+```go
+session := httpcloak.NewSession("chrome-latest",
+    httpcloak.WithHTTP2MaxConnAge(15 * time.Minute),
+)
+defer session.Close()
+```
+
+By default an HTTP/2 connection takes new requests for five minutes, then the
+next request opens a fresh one. This option changes that limit, and `0` turns
+it off so a connection is reused for as long as the server keeps it open.
+Responses already in flight still finish, and idle timeouts and a server's
+GOAWAY still apply. The value is rounded up to whole seconds, and it survives
+`Fork`, `Refresh` and session save/load. The bindings take it in seconds as
+`http2_max_conn_age` (Python) or `http2MaxConnAge` (Node.js, .NET, Android):
+leave it out for five minutes, or pass `0` to turn it off. It covers
+`Session`'s HTTP/2 connections, not HTTP/1.1 or HTTP/3.
+
 ### 🚫 Redirect Control
 
 ```go
@@ -825,7 +847,7 @@ httpcloak.options(url, **kwargs)
 
 # Session class
 session = httpcloak.Session(
-    preset="chrome-latest",       # Browser preset (default)
+    preset="chrome-latest",       # Browser preset (chrome-latest is also the default)
     proxy="socks5://...",      # Proxy URL
     timeout=30,                # Timeout in seconds
     http_version="h3",         # Force protocol: h1, h2, h3, auto
@@ -1026,11 +1048,13 @@ response.Protocol
 
 | Browser | Versions | Platform suffixes | PQ | HTTP/3 |
 |---------|----------|-------------------|:--:|:------:|
-| Chrome | 143 to 152, `latest` | `-windows` `-linux` `-macos` `-android` `-ios` | yes | yes |
+| Chrome | 143 to 158, `latest` | `-windows` `-linux` `-macos` `-android` `-ios` (no 149 for `-android` or `-ios`; iOS: 143 to 148, 150 to 152, and 155) | yes | yes |
 | Chrome | 133, 141 | none | yes | no |
 | Firefox | 148, `latest` | `-windows` `-linux` `-macos` | yes | no |
 | Firefox | 133 | `-windows` `-linux` `-macos` | no | no |
-| Safari | 18, `latest` | none, `-ios` | yes | yes |
+| Safari | 18, `latest` | none | yes | yes |
+| Safari | 26, `latest` | `-ios` | yes | off by default (h2 capture only) |
+| Safari | 18 | `-ios` | yes | yes |
 | Safari | 17 | `-ios` | no | no |
 
 **PQ** = post-quantum key exchange (X25519MLKEM768). `Presets()` returns the full list.
@@ -1052,6 +1076,8 @@ Any field below is editable in the JSON spec produced by `describe_preset` (see 
 | `preset.http3` | HTTP/3 / QUIC parameters |
 | `preset.tcp` | TCP/IP fingerprint |
 | `preset.headers.values` / `preset.headers.order` | Header values and request order |
+| `preset.headers.image_accept` | `Accept` header for image loads (Chrome 155 added `image/jxl`) |
+| `preset.tls.trust_anchors` / `preset.tls.quic_trust_anchors_shuffle` | Trust anchor IDs, and whether QUIC reshuffles them per connection |
 
 Round-trip is byte-equal — `describe_preset` → mutate JSON → `load_preset_from_json` → run → `describe_preset` returns identical bytes.
 

@@ -104,7 +104,7 @@ type LocalProxyConfig struct {
 	// Port to listen on (0 = auto-select)
 	Port int
 
-	// Browser fingerprint preset (default: chrome-146)
+	// Browser fingerprint preset (default: chrome-latest)
 	Preset string
 
 	// Request timeout
@@ -120,6 +120,10 @@ type LocalProxyConfig struct {
 	// TLSOnly mode: only apply TLS fingerprinting, pass HTTP headers through unchanged.
 	// Useful when the client (e.g., Playwright) already provides authentic browser headers.
 	TLSOnly bool
+
+	// InsecureSkipVerify turns off certificate verification for the sites the
+	// proxy connects to, as WithInsecureSkipVerify does for a Session.
+	InsecureSkipVerify bool
 
 	// SessionCacheBackend is an optional distributed cache for TLS sessions.
 	// Enables session sharing across multiple LocalProxy instances.
@@ -170,6 +174,16 @@ func WithProxyTLSOnly() LocalProxyOption {
 	}
 }
 
+// WithProxyInsecureSkipVerify turns off certificate verification for the
+// sites the proxy connects to, for a server with a self-signed or otherwise
+// untrusted certificate. Only for testing; it removes TLS's protection
+// against a machine in the middle.
+func WithProxyInsecureSkipVerify() LocalProxyOption {
+	return func(c *LocalProxyConfig) {
+		c.InsecureSkipVerify = true
+	}
+}
+
 // WithProxySessionCache sets a distributed TLS session cache backend for the proxy.
 // This enables TLS session ticket sharing across multiple proxy instances.
 func WithProxySessionCache(backend transport.SessionCacheBackend, errorCallback transport.ErrorCallback) LocalProxyOption {
@@ -193,7 +207,7 @@ func WithProxySessionCache(backend transport.SessionCacheBackend, errorCallback 
 func StartLocalProxy(port int, opts ...LocalProxyOption) (*LocalProxy, error) {
 	config := &LocalProxyConfig{
 		Port:           port,
-		Preset:         "chrome-146",
+		Preset:         "chrome-latest",
 		Timeout:        30 * time.Second,
 		MaxConnections: 1000,
 	}
@@ -229,6 +243,9 @@ func StartLocalProxy(port int, opts ...LocalProxyOption) (*LocalProxy, error) {
 	}
 	if config.TLSOnly {
 		sessionOpts = append(sessionOpts, WithTLSOnly())
+	}
+	if config.InsecureSkipVerify {
+		sessionOpts = append(sessionOpts, WithInsecureSkipVerify())
 	}
 	if config.SessionCacheBackend != nil {
 		sessionOpts = append(sessionOpts, WithSessionCache(config.SessionCacheBackend, config.SessionCacheErrorCallback))
@@ -347,12 +364,12 @@ func (p *LocalProxy) Stats() map[string]interface{} {
 	p.sessionRegistryMu.RUnlock()
 
 	return map[string]interface{}{
-		"running":           p.running.Load(),
-		"port":              p.port,
-		"active_conns":      p.activeConns.Load(),
-		"total_requests":    p.totalReqs.Load(),
-		"preset":            p.preset,
-		"max_connections":   p.maxConnections,
+		"running":             p.running.Load(),
+		"port":                p.port,
+		"active_conns":        p.activeConns.Load(),
+		"total_requests":      p.totalReqs.Load(),
+		"preset":              p.preset,
+		"max_connections":     p.maxConnections,
 		"registered_sessions": sessionCount,
 	}
 }
@@ -630,7 +647,7 @@ func (p *LocalProxy) handleHTTPWithSession(ctx context.Context, clientConn net.C
 		Method:  req.Method,
 		URL:     targetURL,
 		Headers: headers,
-		Body:    req.Body,    // Streaming request body
+		Body:    req.Body, // Streaming request body
 		TLSOnly: tlsOnlyOverride,
 	}
 
@@ -807,7 +824,7 @@ func (p *LocalProxy) createProxyClient(proxyURL string) *http.Client {
 	}
 
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(parsed),
+		Proxy:               http.ProxyURL(parsed),
 		MaxIdleConns:        10,
 		MaxIdleConnsPerHost: 2,
 		IdleConnTimeout:     30 * time.Second,

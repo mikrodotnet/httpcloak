@@ -20,6 +20,7 @@ Example:
 import asyncio
 import base64
 import json
+import math
 import warnings
 
 # The request methods take a parameter called json, which shadows the module
@@ -32,7 +33,18 @@ import platform
 import threading
 import time
 import uuid
-from ctypes import CFUNCTYPE, POINTER, c_char_p, c_int, c_int64, c_void_p, cast, cdll
+from ctypes import (
+    CFUNCTYPE,
+    POINTER,
+    addressof,
+    c_char_p,
+    c_int,
+    c_int64,
+    c_void_p,
+    cast,
+    cdll,
+    create_string_buffer,
+)
 from io import IOBase
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional, Sequence, Tuple, Union
@@ -161,7 +173,58 @@ class Preset:
     CHROME_LATEST_IOS = "chrome-latest-ios"
     CHROME_LATEST_ANDROID = "chrome-latest-android"
 
-    # Chrome 149 (desktop; wire fingerprint identical to 148)
+    # Chrome 153 (headers-only over 152; no iOS preset until one is captured)
+    CHROME_153 = "chrome-153"
+    CHROME_153_WINDOWS = "chrome-153-windows"
+    CHROME_153_LINUX = "chrome-153-linux"
+    CHROME_153_MACOS = "chrome-153-macos"
+    CHROME_153_ANDROID = "chrome-153-android"
+
+    # Chrome 154 (headers-only over 153)
+    CHROME_154 = "chrome-154"
+    CHROME_154_WINDOWS = "chrome-154-windows"
+    CHROME_154_LINUX = "chrome-154-linux"
+    CHROME_154_MACOS = "chrome-154-macos"
+    CHROME_154_ANDROID = "chrome-154-android"
+
+    # Chrome 155 (desktop and Android add image/jxl to Accept; TLS unchanged; iOS captured)
+    CHROME_155 = "chrome-155"
+    CHROME_155_WINDOWS = "chrome-155-windows"
+    CHROME_155_LINUX = "chrome-155-linux"
+    CHROME_155_MACOS = "chrome-155-macos"
+    CHROME_155_IOS = "chrome-155-ios"
+    CHROME_155_ANDROID = "chrome-155-android"
+
+    # Chrome 156 (headers only over 155)
+    CHROME_156 = "chrome-156"
+    CHROME_156_WINDOWS = "chrome-156-windows"
+    CHROME_156_LINUX = "chrome-156-linux"
+    CHROME_156_MACOS = "chrome-156-macos"
+    CHROME_156_ANDROID = "chrome-156-android"
+
+    # Chrome 157 (headers only over 156)
+    CHROME_157 = "chrome-157"
+    CHROME_157_WINDOWS = "chrome-157-windows"
+    CHROME_157_LINUX = "chrome-157-linux"
+    CHROME_157_MACOS = "chrome-157-macos"
+    CHROME_157_ANDROID = "chrome-157-android"
+
+    # Chrome 158 (headers only over 157)
+    CHROME_158 = "chrome-158"
+    CHROME_158_WINDOWS = "chrome-158-windows"
+    CHROME_158_LINUX = "chrome-158-linux"
+    CHROME_158_MACOS = "chrome-158-macos"
+    CHROME_158_ANDROID = "chrome-158-android"
+
+    # Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
+    CHROME_152 = "chrome-152"
+    CHROME_152_WINDOWS = "chrome-152-windows"
+    CHROME_152_LINUX = "chrome-152-linux"
+    CHROME_152_MACOS = "chrome-152-macos"
+    CHROME_152_ANDROID = "chrome-152-android"
+    CHROME_152_IOS = "chrome-152-ios"
+
+    # Chrome 151 (headers only over 150)
     CHROME_151 = "chrome-151"
     CHROME_151_WINDOWS = "chrome-151-windows"
     CHROME_151_LINUX = "chrome-151-linux"
@@ -253,6 +316,7 @@ class Preset:
     SAFARI_18 = "safari-18"
     SAFARI_17_IOS = "safari-17-ios"
     SAFARI_18_IOS = "safari-18-ios"
+    SAFARI_26_IOS = "safari-26-ios"
     SAFARI_LATEST_IOS = "safari-latest-ios"
 
     # Backwards compatibility aliases (old naming convention used "ios-chrome" / "android-chrome" prefix)
@@ -272,6 +336,7 @@ class Preset:
     ANDROID_CHROME_LATEST = CHROME_LATEST_ANDROID
     IOS_SAFARI_17 = SAFARI_17_IOS
     IOS_SAFARI_18 = SAFARI_18_IOS
+    IOS_SAFARI_26 = SAFARI_26_IOS
     IOS_SAFARI_LATEST = SAFARI_LATEST_IOS
 
     @classmethod
@@ -279,30 +344,17 @@ class Preset:
         """
         Return list of all built-in preset names known to this binding version.
 
+        Built from the constants above, each name once, so a new constant can
+        never be left out of it.
+
         For the authoritative live list (which may include custom presets loaded
         at runtime), call `httpcloak.available_presets()` instead.
         """
-        return [
-            cls.CHROME_LATEST, cls.CHROME_LATEST_WINDOWS, cls.CHROME_LATEST_LINUX,
-            cls.CHROME_LATEST_MACOS, cls.CHROME_LATEST_IOS, cls.CHROME_LATEST_ANDROID,
-            cls.CHROME_149, cls.CHROME_149_WINDOWS, cls.CHROME_149_LINUX, cls.CHROME_149_MACOS,
-            cls.CHROME_148, cls.CHROME_148_WINDOWS, cls.CHROME_148_LINUX, cls.CHROME_148_MACOS,
-            cls.CHROME_148_IOS, cls.CHROME_148_ANDROID,
-            cls.CHROME_147, cls.CHROME_147_WINDOWS, cls.CHROME_147_LINUX, cls.CHROME_147_MACOS,
-            cls.CHROME_147_IOS, cls.CHROME_147_ANDROID,
-            cls.CHROME_146, cls.CHROME_146_WINDOWS, cls.CHROME_146_LINUX, cls.CHROME_146_MACOS,
-            cls.CHROME_146_IOS, cls.CHROME_146_ANDROID,
-            cls.CHROME_145, cls.CHROME_145_WINDOWS, cls.CHROME_145_LINUX, cls.CHROME_145_MACOS,
-            cls.CHROME_145_IOS, cls.CHROME_145_ANDROID,
-            cls.CHROME_144, cls.CHROME_144_WINDOWS, cls.CHROME_144_LINUX, cls.CHROME_144_MACOS,
-            cls.CHROME_144_IOS, cls.CHROME_144_ANDROID,
-            cls.CHROME_143, cls.CHROME_143_WINDOWS, cls.CHROME_143_LINUX, cls.CHROME_143_MACOS,
-            cls.CHROME_143_IOS, cls.CHROME_143_ANDROID,
-            cls.CHROME_141, cls.CHROME_133,
-            cls.FIREFOX_LATEST, cls.FIREFOX_148, cls.FIREFOX_133,
-            cls.SAFARI_LATEST, cls.SAFARI_18, cls.SAFARI_17_IOS, cls.SAFARI_18_IOS,
-            cls.SAFARI_LATEST_IOS,
-        ]
+        names: List[str] = []
+        for attr, value in vars(cls).items():
+            if attr.isupper() and isinstance(value, str) and value not in names:
+                names.append(value)
+        return names
 
 
 # HTTP status reason phrases
@@ -339,7 +391,7 @@ class Cookie:
         domain: Cookie domain
         path: Cookie path
         expires: Expiration date (RFC1123 format)
-        max_age: Max age in seconds (0 means not set)
+        max_age: Max age in seconds (0 means not set, -1 means the server asked to delete it)
         secure: Secure flag
         http_only: HttpOnly flag
         same_site: SameSite attribute (Strict, Lax, None)
@@ -1009,7 +1061,11 @@ ASYNC_CALLBACK = CFUNCTYPE(None, c_int64, c_char_p, c_char_p)
 
 # Session cache callback types
 # get: char* (*)(const char* key) - returns JSON string or NULL
-SESSION_CACHE_GET_CALLBACK = CFUNCTYPE(c_char_p, c_char_p)
+# The get callbacks return c_void_p, not c_char_p: a Python callback that
+# returns bytes through a c_char_p result makes ctypes keep a reference it can
+# never drop, so every cache hit would leak its value. They return the address
+# of a buffer the backend keeps alive instead (see SessionCacheBackend).
+SESSION_CACHE_GET_CALLBACK = CFUNCTYPE(c_void_p, c_char_p)
 # put: int (*)(const char* key, const char* value_json, int64_t ttl_seconds)
 SESSION_CACHE_PUT_CALLBACK = CFUNCTYPE(c_int, c_char_p, c_char_p, c_int64)
 # delete: int (*)(const char* key)
@@ -1017,7 +1073,7 @@ SESSION_CACHE_DELETE_CALLBACK = CFUNCTYPE(c_int, c_char_p)
 # error: void (*)(const char* operation, const char* key, const char* error)
 SESSION_CACHE_ERROR_CALLBACK = CFUNCTYPE(None, c_char_p, c_char_p, c_char_p)
 # ech_get: char* (*)(const char* key) - returns base64 string or NULL
-ECH_CACHE_GET_CALLBACK = CFUNCTYPE(c_char_p, c_char_p)
+ECH_CACHE_GET_CALLBACK = CFUNCTYPE(c_void_p, c_char_p)
 # ech_put: int (*)(const char* key, const char* value_base64, int64_t ttl_seconds)
 ECH_CACHE_PUT_CALLBACK = CFUNCTYPE(c_int, c_char_p, c_char_p, c_int64)
 
@@ -1648,8 +1704,24 @@ def _apply_auth(
     credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
 
     headers = headers.copy() if headers else {}
+    # auth= wins over an Authorization header in any spelling, as in requests,
+    # and only one goes out.
+    for key in [k for k in headers if k.lower() == "authorization"]:
+        del headers[key]
     headers["Authorization"] = f"Basic {credentials}"
     return headers
+
+
+def _default_header(headers: Dict[str, str], name: str, value: str) -> None:
+    """Set name to value unless the caller already set it, in any spelling.
+
+    The transport sends one spelling of a header name and prefers the
+    canonical one, so a default added beside a caller's lowercase spelling
+    would replace the caller's value.
+    """
+    lname = name.lower()
+    if not any(k.lower() == lname for k in headers):
+        headers[name] = value
 
 
 def version() -> str:
@@ -1750,7 +1822,7 @@ class Session:
     API is compatible with requests.Session.
 
     Args:
-        preset: Browser preset (default: "chrome-146")
+        preset: Browser preset (default: "chrome-latest")
         proxy: Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port")
         tcp_proxy: Proxy URL for TCP protocols (HTTP/1.1, HTTP/2) - use with udp_proxy for split config
         udp_proxy: Proxy URL for UDP protocols (HTTP/3 via MASQUE) - use with tcp_proxy for split config
@@ -1774,6 +1846,9 @@ class Session:
             Saves ~15-20ms on first connect at the cost of the privacy bump ECH provides.
         tls_only: TLS-only mode - skip preset HTTP headers, only apply TLS fingerprint (default: False)
         quic_idle_timeout: QUIC connection idle timeout in seconds (default: 30). Set higher for long-lived H3 connections.
+        http2_max_conn_age: Seconds after which an HTTP/2 connection takes no new requests and a fresh
+            one is opened (default: None, five minutes). 0 turns the limit off, so a connection is
+            reused for as long as the server keeps it open. Requests already on it still finish.
         local_address: Local IP address to bind outgoing connections to (e.g., "192.168.1.100" or "::1")
         key_log_file: Path to write TLS key log (NSS format) for Wireshark decryption
         enable_speculative_tls: Enable speculative TLS optimization for proxy connections (default: False).
@@ -1809,7 +1884,7 @@ class Session:
 
     def __init__(
         self,
-        preset: str = "chrome-146",
+        preset: str = "chrome-latest",
         proxy: Optional[str] = None,
         tcp_proxy: Optional[str] = None,
         udp_proxy: Optional[str] = None,
@@ -1846,6 +1921,7 @@ class Session:
         tcp_window_size: Optional[int] = None,
         tcp_window_scale: Optional[int] = None,
         tcp_df: Optional[bool] = None,
+        http2_max_conn_age: Optional[float] = None,
     ):
         self._lib = _get_lib()
         self._default_timeout = timeout
@@ -1883,6 +1959,14 @@ class Session:
             config["tls_only"] = True
         if quic_idle_timeout > 0:
             config["quic_idle_timeout"] = quic_idle_timeout
+        if http2_max_conn_age is not None:
+            # The library takes whole seconds. A float went over as 90.0,
+            # which it could not read, and that turned the limit off.
+            if isinstance(http2_max_conn_age, bool) or not isinstance(http2_max_conn_age, (int, float)):
+                raise TypeError("http2_max_conn_age must be a number of seconds")
+            if not math.isfinite(http2_max_conn_age):
+                raise ValueError("http2_max_conn_age must be finite; 0 turns the limit off")
+            config["http2_max_conn_age"] = int(math.ceil(http2_max_conn_age))
         if local_address:
             config["local_address"] = local_address
         if key_log_file:
@@ -2026,7 +2110,19 @@ class Session:
             return None
         merged = dict(self.headers)
         if headers:
-            merged.update(headers)
+            # Header names are case-insensitive: a request's "authorization"
+            # replaces the session's "Authorization" instead of going out
+            # beside it as a second Authorization line. A list or tuple of
+            # (name, value) pairs is accepted too, as dict.update and
+            # requests accept it.
+            names = {k.lower(): k for k in merged}
+            items = headers.items() if hasattr(headers, "items") else headers
+            for key, value in items:
+                previous = names.get(key.lower())
+                if previous is not None and previous != key:
+                    del merged[previous]
+                merged[key] = value
+                names[key.lower()] = key
         return merged if merged else None
 
     def _apply_cookies(
@@ -2040,12 +2136,14 @@ class Session:
         cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
         headers = headers.copy() if headers else {}
-        # Merge with existing Cookie header if present
-        existing = headers.get("Cookie", "")
+        # Merge with an existing Cookie header in whatever case it was given,
+        # so a caller's "cookie" and these don't become two Cookie headers.
+        key = next((k for k in headers if k.lower() == "cookie"), "Cookie")
+        existing = headers.get(key, "")
         if existing:
-            headers["Cookie"] = f"{existing}; {cookie_str}"
+            headers[key] = f"{existing}; {cookie_str}"
         else:
-            headers["Cookie"] = cookie_str
+            headers[key] = cookie_str
         return headers
 
     def _streaming_upload(
@@ -2190,7 +2288,10 @@ class Session:
             effective_auth = auth if auth is not None else self.auth
             merged_headers = _apply_auth(merged_headers, effective_auth)
             merged_headers = self._apply_cookies(merged_headers, cookies)
-            content_type = (merged_headers or {}).get("Content-Type", "application/octet-stream")
+            content_type = next(
+                (v for k, v in (merged_headers or {}).items() if k.lower() == "content-type"),
+                "application/octet-stream",
+            )
             return self._streaming_upload(
                 "POST",
                 url,
@@ -2211,12 +2312,12 @@ class Session:
         elif json is not None:
             body = json_module.dumps(json).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body = data.encode("utf-8")
             else:
@@ -2324,12 +2425,12 @@ class Session:
         elif json is not None:
             body_bytes = json_module.dumps(json).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body_bytes = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body_bytes = data.encode("utf-8")
             elif isinstance(data, bytes):
@@ -2603,12 +2704,12 @@ class Session:
         elif json_data is not None:
             body = _json.dumps(json_data).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body = data.encode("utf-8")
             else:
@@ -2724,12 +2825,12 @@ class Session:
         elif json_data is not None:
             body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data)
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, bytes):
                 body = base64.b64encode(data).decode("ascii")
                 body_encoding = "base64"
@@ -2898,7 +2999,7 @@ class Session:
             secure: Secure flag
             http_only: HttpOnly flag
             same_site: SameSite attribute (Strict, Lax, None)
-            max_age: Max age in seconds (0 means not set)
+            max_age: Max age in seconds (0 means not set, -1 means the server asked to delete it)
             expires: Expiration date in RFC1123 format (e.g. "Mon, 02 Jan 2006 15:04:05 GMT")
         """
         cookie = {
@@ -3572,14 +3673,15 @@ class Session:
             # body with no headers could not be sent at all. The sync methods
             # already guard the same way.
             merged_headers = merged_headers or {}
-            merged_headers["content-type"] = "application/json"
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 # Form data
                 from urllib.parse import urlencode
                 body_bytes = urlencode(data).encode("utf-8")
                 body_len = len(body_bytes)
-                merged_headers["content-type"] = "application/x-www-form-urlencoded"
+                merged_headers = merged_headers or {}
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body_bytes = data.encode("utf-8")
                 body_len = len(body_bytes)
@@ -3677,12 +3779,13 @@ class Session:
             # body with no headers could not be sent at all. The sync methods
             # already guard the same way.
             merged_headers = merged_headers or {}
-            merged_headers["content-type"] = "application/json"
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body_bytes = urlencode(data).encode("utf-8")
                 body_len = len(body_bytes)
-                merged_headers["content-type"] = "application/x-www-form-urlencoded"
+                merged_headers = merged_headers or {}
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body_bytes = data.encode("utf-8")
                 body_len = len(body_bytes)
@@ -3866,7 +3969,7 @@ class Session:
         )
 
         if stream_handle < 0:
-            raise HTTPCloakError("Failed to start streaming request")
+            raise HTTPCloakError(_last_error(self._lib, self._handle, "Failed to start streaming request"))
 
         # Get metadata
         metadata_ptr = self._lib.httpcloak_stream_get_metadata(stream_handle)
@@ -3949,12 +4052,12 @@ class Session:
         if json_data is not None:
             body = _json.dumps(json_data).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body = data.encode("utf-8")
             else:
@@ -3991,7 +4094,7 @@ class Session:
         )
 
         if stream_handle < 0:
-            raise HTTPCloakError("Failed to start streaming request")
+            raise HTTPCloakError(_last_error(self._lib, self._handle, "Failed to start streaming request"))
 
         # Get metadata
         metadata_ptr = self._lib.httpcloak_stream_get_metadata(stream_handle)
@@ -4205,7 +4308,7 @@ class Session:
         )
 
         if stream_handle < 0:
-            raise HTTPCloakError("Failed to start streaming request")
+            raise HTTPCloakError(_last_error(self._lib, self._handle, "Failed to start streaming request"))
 
         # Get metadata
         metadata_ptr = self._lib.httpcloak_stream_get_metadata(stream_handle)
@@ -4334,12 +4437,12 @@ class Session:
         if json_data is not None:
             body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data)
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, bytes):
                 body = data.decode("utf-8")
             else:
@@ -4432,12 +4535,12 @@ class Session:
         if json_data is not None:
             body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data)
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, bytes):
                 body = data.decode("utf-8")
             else:
@@ -4463,7 +4566,7 @@ _default_config: Dict[str, Any] = {}
 
 
 def configure(
-    preset: str = "chrome-146",
+    preset: str = "chrome-latest",
     headers: Optional[Dict[str, str]] = None,
     auth: Optional[Tuple[str, str]] = None,
     proxy: Optional[str] = None,
@@ -4475,15 +4578,18 @@ def configure(
     retry: int = 0,
     retry_on_status: Optional[List[int]] = None,
     prefer_ipv4: bool = False,
+    **session_options: Any,
 ) -> None:
     """
     Configure defaults for module-level functions.
 
     This creates/recreates the default session with the specified settings.
     All subsequent calls to httpcloak.get(), httpcloak.post(), etc. will use these defaults.
+    Any other Session option (ja3, disable_http3, tls_only, local_address and
+    so on) can be passed as well and goes straight to the session.
 
     Args:
-        preset: Browser preset (default: "chrome-146")
+        preset: Browser preset (default: "chrome-latest")
         headers: Default headers for all requests
         auth: Default basic auth tuple (username, password)
         proxy: Proxy URL (e.g., "http://user:pass@host:port")
@@ -4495,6 +4601,7 @@ def configure(
         retry: Number of retries on failure (default: 0, no retries)
         retry_on_status: List of status codes to retry on (default: None — only consulted when retry > 0)
         prefer_ipv4: Prefer IPv4 addresses over IPv6 (default: False)
+        **session_options: Any other Session keyword argument
 
     Example:
         import httpcloak
@@ -4519,8 +4626,7 @@ def configure(
         # Apply auth to headers if provided
         final_headers = _apply_auth(headers, auth) or {}
 
-        # Store config
-        _default_config = {
+        config = {
             "preset": preset,
             "proxy": proxy,
             "timeout": timeout,
@@ -4530,25 +4636,25 @@ def configure(
             "max_redirects": max_redirects,
             "retry": retry,
             "retry_on_status": retry_on_status,
-            "headers": final_headers,
             "prefer_ipv4": prefer_ipv4,
+            **session_options,
         }
 
-        # Create new session with config
-        _default_session = Session(
-            preset=preset,
-            proxy=proxy,
-            timeout=timeout,
-            http_version=http_version,
-            verify=verify,
-            allow_redirects=allow_redirects,
-            max_redirects=max_redirects,
-            retry=retry,
-            retry_on_status=retry_on_status,
-            prefer_ipv4=prefer_ipv4,
-        )
+        # Create the session first, so an unknown option fails here and leaves
+        # the previous defaults in place.
+        session = Session(**config)
         if final_headers:
-            _default_session.headers.update(final_headers)
+            session.headers.update(final_headers)
+        _default_config = {**config, "headers": final_headers}
+        _default_session = session
+
+
+def _default_session_options(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The configured Session options, with any per-call overrides on top."""
+    options = {k: v for k, v in _default_config.items() if k != "headers"}
+    if overrides:
+        options.update(overrides)
+    return options
 
 
 def load_preset(path: str) -> str:
@@ -4791,25 +4897,28 @@ class LocalProxy:
     def __init__(
         self,
         port: int = 0,
-        preset: str = "chrome-146",
+        preset: str = "chrome-latest",
         timeout: int = 30,
         max_connections: int = 1000,
         tcp_proxy: Optional[str] = None,
         udp_proxy: Optional[str] = None,
         tls_only: bool = False,
+        verify: bool = True,
     ):
         """
         Create and start a local HTTP proxy server.
 
         Args:
             port: Port to listen on (0 = auto-select available port)
-            preset: Browser fingerprint preset (default: "chrome-146")
+            preset: Browser fingerprint preset (default: "chrome-latest")
             timeout: Request timeout in seconds (default: 30)
             max_connections: Maximum concurrent connections (default: 1000)
             tcp_proxy: Default upstream TCP proxy URL (can be overridden per-request)
             udp_proxy: Default upstream UDP proxy URL (can be overridden per-request)
             tls_only: TLS-only mode - skip preset HTTP headers, only apply TLS fingerprint.
                       Use this when your client already provides authentic browser headers.
+            verify: Verify the certificates of the sites the proxy connects to (default: True).
+                    False is for testing against a self-signed certificate.
         """
         self._lib = _get_lib()
         self._handle: int = -1
@@ -4826,6 +4935,8 @@ class LocalProxy:
             config["udp_proxy"] = udp_proxy
         if tls_only:
             config["tls_only"] = True
+        if not verify:
+            config["verify"] = False
 
         config_json = json.dumps(config).encode("utf-8")
         self._handle = self._lib.httpcloak_local_proxy_start(config_json)
@@ -5084,25 +5195,25 @@ class SessionCacheBackend:
         self._c_put_ech = None
         self._c_error = None
 
-        # Persistent buffers for the get/get_ech callbacks. The Go side does
-        # NOT free the bytes we return and copies via C.GoString AFTER the
-        # callback frame unwinds, so a transient `result.encode()` would be
-        # freed by CPython before Go reads it (use-after-free).
+        # Persistent buffers for the get/get_ech callbacks. The callbacks hand
+        # back a raw address, and the native side copies the string only after
+        # the callback frame unwinds and does not free it, so a transient
+        # buffer would be freed by CPython before the copy (use-after-free).
         #
         # A single per-instance slot fixes the serial case but re-introduces
         # the UAF when ONE backend is shared across sessions/threads (a common
         # cache-pool pattern): a concurrent get on another thread overwrites
-        # the slot before Go copies the previous result. Instead we retain the
-        # last N encoded buffers in a bounded, lock-guarded ring. Each fresh
-        # buffer stays referenced until N more get calls happen — far more than
-        # the microsecond window between returning to Go and its C.GoString
-        # copy — so recent buffers survive concurrent shared-backend use
+        # the slot before the native side copies the previous result. Instead
+        # we retain the last N buffers in a bounded, lock-guarded ring. Each
+        # fresh buffer stays referenced until N more get calls happen, far
+        # more than the microsecond window between returning and the native
+        # copy, so recent buffers survive concurrent shared-backend use
         # without unbounded growth.
         from collections import deque
 
-        self._get_buf_lock = Lock()
+        self._get_buf_lock = threading.Lock()
         self._get_buf_ring = deque(maxlen=128)
-        self._ech_get_buf_lock = Lock()
+        self._ech_get_buf_lock = threading.Lock()
         self._ech_get_buf_ring = deque(maxlen=128)
 
     def _make_get_callback(self):
@@ -5118,14 +5229,14 @@ class SessionCacheBackend:
                 result = get_fn(key)
                 if result is None:
                     return None
-                # Retain the encoded bytes in the bounded ring so the buffer
-                # outlives this callback frame — Go copies it via C.GoString
-                # after we return and does not free it. The lock-guarded ring
-                # keeps recent buffers referenced under concurrent shared use.
-                buf = result.encode("utf-8")
+                # Retain the buffer in the bounded ring so it outlives this
+                # callback frame: the native side copies it after we return
+                # and does not free it. The lock-guarded ring keeps recent
+                # buffers referenced under concurrent shared use.
+                buf = create_string_buffer(result.encode("utf-8"))
                 with owner._get_buf_lock:
                     owner._get_buf_ring.append(buf)
-                return buf
+                return addressof(buf)
             except Exception:
                 return None
 
@@ -5175,14 +5286,14 @@ class SessionCacheBackend:
                 result = get_fn(key)
                 if result is None:
                     return None
-                # Retain the encoded bytes in the bounded ring so the buffer
-                # outlives this callback frame — Go copies it via C.GoString
-                # after we return and does not free it. The lock-guarded ring
-                # keeps recent buffers referenced under concurrent shared use.
-                buf = result.encode("utf-8")
+                # Retain the buffer in the bounded ring so it outlives this
+                # callback frame: the native side copies it after we return
+                # and does not free it. The lock-guarded ring keeps recent
+                # buffers referenced under concurrent shared use.
+                buf = create_string_buffer(result.encode("utf-8"))
                 with owner._ech_get_buf_lock:
                     owner._ech_get_buf_ring.append(buf)
-                return buf
+                return addressof(buf)
             except Exception:
                 return None
 
@@ -5391,32 +5502,11 @@ def _get_default_session() -> Session:
     if _default_session is None:
         with _default_session_lock:
             if _default_session is None:
-                preset = _default_config.get("preset", "chrome-146")
-                proxy = _default_config.get("proxy")
-                timeout = _default_config.get("timeout", 30)
-                http_version = _default_config.get("http_version", "auto")
-                verify = _default_config.get("verify", True)
-                allow_redirects = _default_config.get("allow_redirects", True)
-                max_redirects = _default_config.get("max_redirects", 10)
-                retry = _default_config.get("retry", 0)
-                retry_on_status = _default_config.get("retry_on_status")
+                session = Session(**_default_session_options())
                 headers = _default_config.get("headers", {})
-                prefer_ipv4 = _default_config.get("prefer_ipv4", False)
-
-                _default_session = Session(
-                    preset=preset,
-                    proxy=proxy,
-                    timeout=timeout,
-                    http_version=http_version,
-                    verify=verify,
-                    allow_redirects=allow_redirects,
-                    max_redirects=max_redirects,
-                    retry=retry,
-                    retry_on_status=retry_on_status,
-                    prefer_ipv4=prefer_ipv4,
-                )
                 if headers:
-                    _default_session.headers.update(headers)
+                    session.headers.update(headers)
+                _default_session = session
     return _default_session
 
 
@@ -5453,39 +5543,16 @@ def _get_session_for_request(kwargs: dict) -> Tuple[Session, bool]:
     if not has_override:
         return _get_default_session(), False
 
-    # Get current defaults and apply overrides
-    final_preset = preset if preset is not None else _default_config.get("preset", "chrome-146")
-    final_proxy = proxy if proxy is not None else _default_config.get("proxy")
-    final_tcp_proxy = tcp_proxy if tcp_proxy is not None else _default_config.get("tcp_proxy")
-    final_udp_proxy = udp_proxy if udp_proxy is not None else _default_config.get("udp_proxy")
-    final_timeout = _default_config.get("timeout", 30)
-    final_http_version = http_version if http_version is not None else _default_config.get("http_version", "auto")
-    final_verify = verify if verify is not None else _default_config.get("verify", True)
-    final_allow_redirects = allow_redirects if allow_redirects is not None else _default_config.get("allow_redirects", True)
-    final_max_redirects = max_redirects if max_redirects is not None else _default_config.get("max_redirects", 10)
-    final_retry = retry if retry is not None else _default_config.get("retry", 0)
-    final_retry_on_status = retry_on_status if retry_on_status is not None else _default_config.get("retry_on_status")
-    final_prefer_ipv4 = prefer_ipv4 if prefer_ipv4 is not None else _default_config.get("prefer_ipv4", False)
-    final_connect_to = connect_to if connect_to is not None else _default_config.get("connect_to")
-    final_ech_config_domain = ech_config_domain if ech_config_domain is not None else _default_config.get("ech_config_domain")
-
-    # Create temporary session with overrides
-    temp_session = Session(
-        preset=final_preset,
-        proxy=final_proxy,
-        tcp_proxy=final_tcp_proxy,
-        udp_proxy=final_udp_proxy,
-        timeout=final_timeout,
-        http_version=final_http_version,
-        verify=final_verify,
-        allow_redirects=final_allow_redirects,
-        max_redirects=final_max_redirects,
-        retry=final_retry,
-        retry_on_status=final_retry_on_status,
-        prefer_ipv4=final_prefer_ipv4,
-        connect_to=final_connect_to,
-        ech_config_domain=final_ech_config_domain,
-    )
+    # Start from the configured defaults, every option configure() was given,
+    # and apply the overrides on top
+    overrides = {
+        "preset": preset, "proxy": proxy, "tcp_proxy": tcp_proxy, "udp_proxy": udp_proxy,
+        "verify": verify, "allow_redirects": allow_redirects, "http_version": http_version,
+        "max_redirects": max_redirects, "retry": retry, "retry_on_status": retry_on_status,
+        "prefer_ipv4": prefer_ipv4, "connect_to": connect_to, "ech_config_domain": ech_config_domain,
+    }
+    temp_session = Session(**_default_session_options(
+        {k: v for k, v in overrides.items() if v is not None}))
 
     # Copy default headers
     default_headers = _default_config.get("headers", {})
